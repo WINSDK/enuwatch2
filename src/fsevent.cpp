@@ -1,8 +1,9 @@
+#include "log.h"
+#include "watcher.h"
+
 #include <CoreFoundation/CFArray.h>
 #include <CoreServices/CoreServices.h>
 #include <print>
-#include "log.h"
-#include "watcher.h"
 
 namespace enu::watcher {
 
@@ -121,19 +122,19 @@ Watcher::Watcher(const std::string &path, double latency) {
   FSEventStreamSetDispatchQueue(stream_, queue_);
 }
 
-void Watcher::run_in_thread(Handler&& h) {
-  handler_ = h; // Pointer to handler_ was given earlier in FSEventStreamContext.
-
-  if (!FSEventStreamStart(stream_))
-    fatal("FSEventStreamStart shouldn't fail, old version of MacOS?");
-}
-
 Watcher::~Watcher() {
   FSEventStreamStop(stream_);
   FSEventStreamInvalidate(stream_);
   FSEventStreamRelease(stream_);
 
   dispatch_release(queue_);
+}
+
+void Watcher::run_in_thread(Handler&& h) {
+  handler_ = h; // Pointer to handler_ was given earlier in FSEventStreamContext.
+
+  if (!FSEventStreamStart(stream_))
+    fatal("FSEventStreamStart shouldn't fail, old version of MacOS?");
 }
 
 } // namespace enu::watcher

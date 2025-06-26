@@ -4,14 +4,23 @@ project(enu LANGUAGES CXX)
 add_executable(enu)
 target_compile_features(enu PRIVATE cxx_std_23)
 
-target_sources(enu PRIVATE main.cpp log.cpp argparser.cpp)
+target_sources(enu PRIVATE main.cpp log.cpp argparser.cpp tree_progress.cpp)
 
 if(APPLE)
     target_sources(enu PRIVATE fsevent.cpp)
     target_link_libraries(enu PRIVATE "-framework CoreServices")
+    
+    # Weirdness with clang not linking when using std::println
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++")
 elseif(LINUX)
+    target_sources(enu PRIVATE inotify.cpp)
 else()
     message(FATAL_ERROR "Unsupported OS: only Linux and macOS are supported.")
+endif()
+
+# Clang requires additional flags for jthread
+if (CLANG)
+    target_compile_options(enu PRIVATE -fexperimental-library)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")

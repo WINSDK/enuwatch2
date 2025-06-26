@@ -3,6 +3,11 @@ project(enu LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR
+   CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
+    set(CLANG TRUE)
+endif()
+
 option(ENU_TEST "Build tests" OFF)
 
 add_subdirectory("src/")

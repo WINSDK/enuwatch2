@@ -9,14 +9,14 @@ void print(Level level, Loc loc, std::string_view args) {
   std::string_view color;
   switch (level) {
     case Level::info:
-      color = "\x1B[0m";
+      color = "\x1b[1;38;5;2m";
       break;
     case Level::warn:
-      color = "\033[0;32m";
+      color = "\x1b[1;38;5;3m";
       break;
     case Level::error:
     case Level::fatal:
-      color = "\033[0;31m";
+      color = "\x1b[1;38;5;1m";
       break;
     default:
       // impossible
@@ -28,7 +28,7 @@ void print(Level level, Loc loc, std::string_view args) {
   std::chrono::time_point time = std::chrono::system_clock::now();
 
   std::println(
-    "{:%Y-%m-%d %H:%M:%S}{} [{}:{}] enu::{} {}\033[0m", time, color, filename, loc.line, loc.func, args);
+    "{:%Y-%m-%d %H:%M:%S} [{}:{}] enu::{}{} {} \033[0m", time, filename, loc.line, loc.func, color, args);
 }
 
 } // namespace enu::log

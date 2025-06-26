@@ -1,4 +1,6 @@
 #include "argparser.h"
+
+#include <unistd.h>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,7 +78,7 @@ Args Args::parse(int argc, const char* argv[]) {
     }
   }
 
-  if (arg.user_host.empty()) {
+  if (!arg.daemon && arg.user_host.empty()) {
       std::println("missing user@hostname argument");
       _exit(1);
   }

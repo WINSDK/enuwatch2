@@ -16,6 +16,12 @@
 ### Hashing
 
 * Rolling hash: hmac-sha256
-  - <https://news.ycombinator.com/item?id=18243489>
-  - <https://beeznest.wordpress.com/2005/02/03/rsyncable-gzip>
-  - <https://en.wikipedia.org/wiki/Rolling_hash#Content-based_slicing_using_a_rolling_hash>
+ - <https://news.ycombinator.com/item?id=18243489>
+ - <https://beeznest.wordpress.com/2005/02/03/rsyncable-gzip>
+ - <https://en.wikipedia.org/wiki/Rolling_hash#Content-based_slicing_using_a_rolling_hash>
+
+## File watching
+
+### Linux
+
+* Uses [Inotify](https://man7.org/linux/man-pages/man7/inotify.7.html)
