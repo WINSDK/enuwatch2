@@ -7,7 +7,7 @@
 
 namespace enu::watcher {
 
-void event_callback(
+static void event_callback(
   ConstFSEventStreamRef,
   void* handler_ptr,
   size_t event_count,
@@ -84,7 +84,7 @@ void event_callback(
     handler(std::move(e));
 }
 
-FSEventStreamRef create_stream(CFArrayRef pathsToWatch, double latency, Handler* handler) {
+static FSEventStreamRef create_stream(CFArrayRef pathsToWatch, double latency, Handler* handler) {
   FSEventStreamContext context{};
   context.info = handler;
 
@@ -110,7 +110,7 @@ FSEventStreamRef create_stream(CFArrayRef pathsToWatch, double latency, Handler*
   return stream;
 }
 
-Watcher::Watcher(const std::string &path, double latency) {
+Watcher::Watcher(const std::string& path, double latency) {
   queue_ = dispatch_queue_create("enu_fsevent_queue", nullptr);
 
   CFStringRef c_path =

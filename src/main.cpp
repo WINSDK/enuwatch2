@@ -1,6 +1,6 @@
 #include "argparser.h"
 #include "log.h"
-#include "tree_progress.h"
+#include "tracked.h"
 #include "watcher.h"
 
 #include <fcntl.h>
@@ -247,7 +247,18 @@ static size_t term_height() {
   return 23; // Fallback.
 }
 
-static size_t display_progress(ProgressNode<M>* root, double elapsed_s) {
+std::pair<double, std::string_view> scale(double bytes) {
+  const std::array<std::string_view, 5> UNITS = {"B", "KiB", "MiB", "GiB"};
+
+  size_t idx = 0;
+  while (bytes >= 1024.0 && idx + 1 < UNITS.size()) {
+    bytes /= 1024.0;
+    ++idx;
+  }
+  return {bytes, UNITS[idx]};
+}
+
+static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
   const size_t COL_START = 57;
   const size_t BAR_WIDTH = 40;
 
@@ -289,7 +300,7 @@ static size_t display_progress(ProgressNode<M>* root, double elapsed_s) {
       return std::format("[{:5.1f}% {:5.1f}{:3}]\n", PCT, done_val, done_unit);
   };
 
-  auto visit = [&](const auto& self, ProgressNode<M>* node, std::string prefix, bool last) {
+  auto visit = [&](const auto& self, TrackedNode<M>* node, std::string prefix, bool last) {
     // Too many line to fit in terminal window.
     if (line_count + 1 == max_rows)
       return;
@@ -327,7 +338,7 @@ static size_t display_progress(ProgressNode<M>* root, double elapsed_s) {
     ++line_count;
 
     size_t idx = 0;
-    node->iter_children([&](ProgressNode<M>* child) {
+    node->iter_children([&](TrackedNode<M>* child) {
       ++idx;
       self(self, child, prefix, idx == node->child_count());
     });
@@ -350,7 +361,7 @@ static size_t display_progress(ProgressNode<M>* root, double elapsed_s) {
   return line_count;
 }
 
-void clear_progress(ProgressNode<M>* root) {
+void clear_progress(TrackedNode<M>* root) {
   // Can't use std::print here because we require async signal safety.
   write(STDOUT_FILENO, SYNC_ON.data(), SYNC_ON.size());
   write(STDOUT_FILENO, ERASE_TO_END.data(), ERASE_TO_END.size());
@@ -362,9 +373,9 @@ std::string str_to_lower(std::string s) {
   return s;
 }
 
-static std::jthread scan_dir(const fs::path& root_path, ProgressNode<M>* root_node) {
+static std::jthread scan_dir(const fs::path& root_path, TrackedNode<M>* root_node) {
   return std::jthread{[root_path, root_node] {
-    std::vector<std::pair<fs::path, ProgressNode<M>*>> stack;
+    std::vector<std::pair<fs::path, TrackedNode<M>*>> stack;
     stack.emplace_back(root_path, root_node);
 
     while (!stack.empty()) {
@@ -397,12 +408,12 @@ static std::jthread scan_dir(const fs::path& root_path, ProgressNode<M>* root_no
           case fs::file_type::directory: {
             fs::path sub_path = fs::path{path / meta.name};
 
-            ProgressNode<M>* child = node->add_child(meta);
+            TrackedNode<M>* child = node->add_child(meta);
             stack.emplace_back(sub_path, child);
             break;
           }
           case fs::file_type::regular: {
-            ProgressNode<M>* child = node->add_child(meta);
+            TrackedNode<M>* child = node->add_child(meta);
             child->shift_total(child->meta.fsize);
             child->unlock();
             break;
@@ -419,7 +430,7 @@ static std::jthread scan_dir(const fs::path& root_path, ProgressNode<M>* root_no
   }};
 }
 
-bool send_message(int in_fd, const fs::path& base, const fs::path& path, ProgressNode<M>* node) {
+bool send_message(int in_fd, const fs::path& base, const fs::path& path, TrackedNode<M>* node) {
   const M& meta = node->meta;
 
   std::error_code ec;
@@ -470,22 +481,22 @@ bool send_message(int in_fd, const fs::path& base, const fs::path& path, Progres
   return true;
 };
 
-static bool sync_with_remote(Process proc, const fs::path& root, ProgressNode<M>* root_node) {
+static bool sync_with_remote(Process proc, const fs::path& root, TrackedNode<M>* root_node) {
   StreamHeader hdr{1};
   if (!write_exact(proc.in_fd, &hdr, sizeof hdr))
     return false;
 
   fs::path base = root.parent_path();
 
-  std::queue<std::pair<fs::path, ProgressNode<M>*>> q;
-  std::unordered_map<ProgressNode<M>*, size_t> pending; // Remaining direct children.
+  std::queue<std::pair<fs::path, TrackedNode<M>*>> q;
+  std::unordered_map<TrackedNode<M>*, size_t> pending; // Remaining direct children.
 
-  auto bubble = [&](ProgressNode<M>* node) {
+  auto bubble = [&](TrackedNode<M>* node) {
     while (node) {
       auto it = pending.find(node);
       size_t& left = it->second;
       if (--left == 0) {
-        ProgressNode<M>* tmp = node->parent;
+        TrackedNode<M>* tmp = node->parent;
         node->remove();
         pending.erase(it);
         node = tmp;
@@ -505,18 +516,18 @@ static bool sync_with_remote(Process proc, const fs::path& root, ProgressNode<M>
       return false;
 
     if (node->meta.ftype == fs::file_type::regular) {
-      ProgressNode<M>* parent = node->parent;
+      TrackedNode<M>* parent = node->parent;
       node->remove();
       bubble(parent);
     } else {
       size_t count = 0;
-      node->iter_children([&](ProgressNode<M>* child) {
+      node->iter_children([&](TrackedNode<M>* child) {
         fs::path sub = path / child->meta.name;
         ++count;
         q.emplace(sub, child);
       });
       if (count == 0) { // Empty directory
-        ProgressNode<M>* parent = node->parent;
+        TrackedNode<M>* parent = node->parent;
         node->remove();
         bubble(parent);
       } else {
@@ -684,7 +695,7 @@ int main(int argc, const char* argv[]) {
     watch_dir(arg);
 
     {
-      static ProgressNode<M> root_node{M{arg.path}, display_progress};
+      static TrackedNode<M> root_node{M{arg.path}, display_progress};
       signal(SIGINT, [](int) { clear_progress(&root_node); });
 
       std::jthread scan_thread = scan_dir(arg.path, &root_node);
