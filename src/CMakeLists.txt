@@ -4,7 +4,7 @@ project(enu LANGUAGES CXX)
 add_executable(enu)
 target_compile_features(enu PRIVATE cxx_std_23)
 
-target_sources(enu PRIVATE main.cpp log.cpp argparser.cpp tree_progress.cpp)
+target_sources(enu PRIVATE main.cpp log.cpp argparser.cpp)
 
 if(APPLE)
     target_sources(enu PRIVATE fsevent.cpp)

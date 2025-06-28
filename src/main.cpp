@@ -149,7 +149,7 @@ static IOResult read_exact(int fd, void* buf, size_t len) {
 
 const size_t CHUNK_SIZE = 16 * 1024;
 
-void report_stderr_remote(Process proc) {
+static void report_stderr_remote(Process proc) {
   bool header_printed = false;
   auto buf = std::make_unique<uint8_t[]>(CHUNK_SIZE);
 
@@ -247,7 +247,7 @@ static size_t term_height() {
   return 23; // Fallback.
 }
 
-std::pair<double, std::string_view> scale(double bytes) {
+static std::pair<double, std::string_view> scale(double bytes) {
   const std::array<std::string_view, 5> UNITS = {"B", "KiB", "MiB", "GiB"};
 
   size_t idx = 0;
@@ -259,7 +259,7 @@ std::pair<double, std::string_view> scale(double bytes) {
 }
 
 static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
-  const size_t COL_START = 57;
+  const size_t COL_START = 58;
   const size_t BAR_WIDTH = 40;
 
   std::string out;
@@ -273,9 +273,9 @@ static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
     auto [done_val, done_unit] = scale(static_cast<double>(done));
     auto [speed_val, speed_unit] = scale(elapsed_s > 0.0 ? done / elapsed_s : 0.0);
 
-    const std::string_view FRAMES[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+    const std::array<std::string_view, 10> X = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
     size_t selector = static_cast<size_t>(elapsed_s * 8.0);
-    std::string_view sym = FRAMES[(selector) % (sizeof(FRAMES) / sizeof(*FRAMES))];
+    std::string_view sym = X[selector % X.size()];
 
     return std::format(
       "[{}{}] [{:5.1f}% {:5.1f} {} {:5.1f} {}/s ] {}\n",
@@ -300,39 +300,26 @@ static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
       return std::format("[{:5.1f}% {:5.1f}{:3}]\n", PCT, done_val, done_unit);
   };
 
-  auto visit = [&](const auto& self, TrackedNode<M>* node, std::string prefix, bool last) {
-    // Too many line to fit in terminal window.
+  auto visit = [&](const auto& self, TrackedNode<M>* node, std::string p, size_t p_len, bool last) {
+    // stop when we’re out of vertical space
     if (line_count + 1 == max_rows)
       return;
 
     if (!node->is_root()) {
-      out += prefix;
-      // out += last ? "+- " : "|- ";
-      // prefix += last ? "   " : "|  ";
-      // Utf-8 versions:
+      out += p;
       out += last ? "└─ " : "├─ ";
-      prefix += last ? "   " : "│  ";
+
+      p += last ? "   " : "│  ";
+      p_len += 3; // every chunk is 3 cells wide
     }
-
-    // FIXME: proper utf8
-    auto utf8_size = [](const char* s) {
-      size_t len = 0;
-      while (*s)
-        len += (*s++ & 0xc0) != 0x80;
-      return len;
-    };
-
-    size_t prefix_size = utf8_size(prefix.c_str());
 
     std::string_view text = node->meta.name;
     out += text;
 
-    if (prefix_size + text.size() >= COL_START) {
+    if (p_len + text.size() >= COL_START)
       out += ' ';
-    } else {
-      size_t pad = COL_START - (prefix_size + text.size());
-      out.append(pad, ' ');
-    }
+    else
+      out.append(COL_START - (p_len + text.size()), ' ');
 
     out += node_stats(node->done(), node->total());
     ++line_count;
@@ -340,11 +327,11 @@ static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
     size_t idx = 0;
     node->iter_children([&](TrackedNode<M>* child) {
       ++idx;
-      self(self, child, prefix, idx == node->child_count());
+      self(self, child, p, p_len, idx == node->child_count());
     });
   };
 
-  visit(visit, root, "", true);
+  visit(visit, root, "", true, 0);
 
   out += total_stats(root->sum_done(), root->sum_total());
   ++line_count;
@@ -361,14 +348,14 @@ static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
   return line_count;
 }
 
-void clear_progress(TrackedNode<M>* root) {
+static void clear_progress(TrackedNode<M>* root) {
   // Can't use std::print here because we require async signal safety.
   write(STDOUT_FILENO, SYNC_ON.data(), SYNC_ON.size());
   write(STDOUT_FILENO, ERASE_TO_END.data(), ERASE_TO_END.size());
   write(STDOUT_FILENO, SYNC_OFF.data(), SYNC_OFF.size());
 }
 
-std::string str_to_lower(std::string s) {
+static std::string str_to_lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
   return s;
 }
@@ -390,8 +377,7 @@ static std::jthread scan_dir(const fs::path& root_path, TrackedNode<M>* root_nod
           continue;
         }
 
-        M meta = M{std::move(entry.path())};
-        entries.emplace_back(meta);
+        entries.emplace_back(M{entry.path()});
       }
 
       std::sort(entries.begin(), entries.end(), [](const M& a, const M& b) {
@@ -406,9 +392,9 @@ static std::jthread scan_dir(const fs::path& root_path, TrackedNode<M>* root_nod
       for (M meta : entries) {
         switch (meta.ftype) {
           case fs::file_type::directory: {
+            TrackedNode<M>* child = node->add_child(meta);
             fs::path sub_path = fs::path{path / meta.name};
 
-            TrackedNode<M>* child = node->add_child(meta);
             stack.emplace_back(sub_path, child);
             break;
           }
@@ -430,7 +416,8 @@ static std::jthread scan_dir(const fs::path& root_path, TrackedNode<M>* root_nod
   }};
 }
 
-bool send_message(int in_fd, const fs::path& base, const fs::path& path, TrackedNode<M>* node) {
+static bool
+send_message(int in_fd, const fs::path& base, const fs::path& path, TrackedNode<M>* node) {
   const M& meta = node->meta;
 
   std::error_code ec;
@@ -538,7 +525,7 @@ static bool sync_with_remote(Process proc, const fs::path& root, TrackedNode<M>*
   return true;
 }
 
-int create_file(std::string_view path, size_t size) {
+static int create_file(std::string_view path, size_t size) {
   int fd = open(path.data(), O_RDWR | O_CREAT);
   if (fd == -1) {
     error("open({}): {}", path, strerror(errno));
