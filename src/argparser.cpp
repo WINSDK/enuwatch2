@@ -44,7 +44,7 @@ Args Args::parse(int argc, const char* argv[]) {
       return false;
 
     if (prog_args.empty()) {
-      std::println("flag --{} requires a value", exp);
+      std::println(stderr, "flag --{} requires a value", exp);
       _exit(1);
     }
 
@@ -73,13 +73,13 @@ Args Args::parse(int argc, const char* argv[]) {
     } else if (read_target_host()) {
       arg.user_host = value;
     } else {
-      std::println("invalid argument: '{}'", prog_args[0]);
+      std::println(stderr, "invalid argument: '{}'", prog_args[0]);
       _exit(1);
     }
   }
 
   if (!arg.daemon && arg.user_host.empty()) {
-      std::println("missing user@hostname argument");
+      std::println(stderr, "missing user@hostname argument");
       _exit(1);
   }
 

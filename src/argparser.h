@@ -1,12 +1,15 @@
 #pragma once
 
 #include <string>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 namespace enu {
 
 struct Args {
   bool daemon = false;
-  std::string path;
+  fs::path path;
   double latency = 0.0;
   std::string user_host;
 

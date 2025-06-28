@@ -1,475 +1,712 @@
-// #include "argparser.h"
-// #include "log.h"
-// #include "progress.h"
-// #include "watcher.h"
-//
-// #include <fcntl.h>
-// #include <poll.h>
-// #include <sys/mman.h>
-// #include <sys/stat.h>
-// #include <sys/wait.h>
-// #include <cassert>
-// #include <cstring>
-// #include <filesystem>
-// #include <limits>
-// #include <print>
-// #include <thread>
-//
-// using namespace enu;
-//
-// namespace fs = std::filesystem;
-//
-// struct SSH {
-//   pid_t pid;
-//   int in_fd;
-//   int out_fd;
-//   int err_fd;
-//
-//   int wait_on() {
-//     int status = 0;
-//     if (waitpid(pid, &status, 0) == -1)
-//       return 1;
-//
-//     if (WIFEXITED(status))
-//       return WEXITSTATUS(status);
-//     if (WIFSIGNALED(status))
-//       return 128 + WTERMSIG(status);
-//     return status;
-//   }
-// };
-//
-// static pid_t child_pid = 0;
-//
-// static sigset_t make_block_all() {
-//   sigset_t set;
-//   sigemptyset(&set);
-//   for (int i = 1; i < NSIG; ++i)
-//     if (i != SIGKILL && i != SIGSTOP)
-//       sigaddset(&set, i);
-//   return set;
-// }
-//
-// static void reap_child(int sig) {
-//   if (child_pid > 0) // global or captured
-//     kill(child_pid, SIGKILL); // async-signal-safe
-//   _exit(128 + sig); // mimic default exit code
-// }
-//
-// void install_catch_all(pid_t child) {
-//   child_pid = child;
-//
-//   struct sigaction sa{};
-//   sa.sa_handler = reap_child;
-//   sa.sa_mask = make_block_all(); // block everything else while in handler
-//   sa.sa_flags = SA_RESTART;
-//
-//   for (int i = 1; i < NSIG; ++i)
-//     if (i != SIGKILL && i != SIGSTOP)
-//       sigaction(i, &sa, nullptr);
-// }
-//
-// void remember_children(int) {
-// 	int status;
-// 	pid_t pid;
-// 	/* An empty waitpid() loop was put here by Tridge and we could never
-// 	 * get him to explain why he put it in, so rather than taking it
-// 	 * out we're instead saving the child exit statuses for later use.
-// 	 * The waitpid() loop presumably eliminates all possibility of leaving
-// 	 * zombie children, maybe that's why he did it. */
-// 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-//     if (child_pid == 0) {
-//       child_pid = pid;
-//       break;
-//     }
-// 	}
-// }
-//
-// static struct sigaction sigact;
-//
-// template <typename... Args>
-// static SSH run_ssh_process(const char* prog, Args&&... args) {
-//   int to[2], from[2], err[2];
-//   if (pipe(to) == -1 || pipe(from) == -1 || pipe(err) == -1)
-//     fatal("{}", strerror(errno));
-//
-//   pid_t pid = fork();
-//   if (pid < 0)
-//     fatal("{}", strerror(errno));
-//
-//   install_catch_all(pid);
-//
-// 	sigset_t sigmask;
-// 	sigemptyset(&sigmask);
-// 	sigact.sa_flags = SA_NOCLDSTOP;
-//   signal(SIGCHLD, remember_children);
-//
-//
-//   if (pid == 0) {
-//     // child
-//     dup2(to[0], STDIN_FILENO); // stdin
-//     dup2(from[1], STDOUT_FILENO); // stdout
-//     dup2(err[1], STDERR_FILENO); // stderr
-//
-//     close(to[0]);
-//     close(to[1]);
-//     close(from[0]);
-//     close(from[1]);
-//     close(err[0]);
-//     close(err[1]);
-//
-//     execlp(prog, prog, std::forward<Args>(args)..., nullptr);
-//     _exit(errno); // exec failed
-//   }
-//
-//   // parent
-//   close(to[0]);
-//   close(from[1]);
-//   close(err[1]);
-//
-//   return {pid, to[1], from[0], err[0]};
-// }
-//
-// enum class EntryKind : uint8_t { File, Directory };
-//
-// struct [[gnu::packed]] Header {
-//   uint8_t version = 1;
-// };
-//
-// struct [[gnu::packed]] Message {
-//   EntryKind kind;
-//   uint64_t path_len : 16;
-//   uint64_t data_len : 48;
-//   uint8_t data[];
-// };
-//
-// enum class IOKind {
-//   Ok,
-//   Fail,
-//   Done,
-// };
-//
-// struct IOResult {
-//   IOKind kind = IOKind::Ok;
-//   size_t n_bytes = 0;
-//
-//   operator bool() {
-//     return kind != IOKind::Fail;
-//   }
-// };
-//
-// static IOResult write_partial(int fd, uint8_t buf[], size_t len) {
-//   size_t off = 0;
-//   while (true) {
-//     ssize_t b_wrote = write(fd, &buf[off], len - off);
-//     if (b_wrote == 0)
-//       return {IOKind::Done, off};
-//     if (b_wrote < 0) {
-//       if (errno == EINTR)
-//         continue;
-//       return {IOKind::Fail, off};
-//     }
-//     off += b_wrote;
-//   }
-// }
-//
-// static IOResult write_exact(int fd, uint8_t buf[], size_t len) {
-//   IOResult r = write_partial(fd, buf, len);
-//   if (r.n_bytes != len)
-//     r.kind = IOKind::Fail;
-//   return r;
-// }
-//
-// static IOResult read_partial(int fd, uint8_t buf[], size_t len) {
-//   size_t off = 0;
-//   while (true) {
-//     ssize_t b_read = read(fd, &buf[off], len - off);
-//     if (b_read == 0)
-//       return {IOKind::Done, off};
-//     if (b_read < 0) {
-//       if (errno == EINTR)
-//         continue;
-//       return {IOKind::Fail, off};
-//     }
-//     off += b_read;
-//   }
-// }
-//
-// static IOResult read_exact(int fd, uint8_t buf[], size_t len) {
-//   IOResult r = read_partial(fd, buf, len);
-//   if (r.n_bytes != len)
-//     r.kind = IOKind::Fail;
-//   return r;
-// }
-//
-// const size_t CHUNK_SIZE = 4 * 1024;
-//
-// void report_stderr_remote(SSH conn) {
-//   bool header_printed = false;
-//   auto buf = std::make_unique<uint8_t[]>(CHUNK_SIZE);
-//
-//   while (true) {
-//     IOResult r = read_partial(conn.err_fd, buf.get(), CHUNK_SIZE);
-//     if (!r || r.n_bytes == 0)
-//       break;
-//     if (!header_printed) {
-//       std::println(stderr, "=================================================================");
-//       std::println(stderr, "REMOTE ERROR:");
-//       header_printed = true;
-//     }
-//     write_exact(STDERR_FILENO, buf.get(), r.n_bytes);
-//   }
-//
-//   if (header_printed)
-//     std::println(stderr, "=================================================================");
-// }
-//
-// static std::jthread scan_dir_size(std::string_view root, ProgressBar& pg) {
-//   auto sum_filesize = [&, root] { // Capturing root is necessary here.
-//     for (const fs::directory_entry& entry : fs::recursive_directory_iterator(root))
-//       if (entry.is_regular_file())
-//         pg.incr_goal(entry.file_size());
-//   };
-//
-//   return std::jthread{sum_filesize};
-// }
-//
-// static bool sync_to_remote(SSH conn, std::string_view root, ProgressBar& pg) {
-//   auto buf = std::make_unique<uint8_t[]>(CHUNK_SIZE);
-//
-//   std::error_code ec;
-//   for (const fs::directory_entry& entry : fs::recursive_directory_iterator(root, ec)) {
-//     if (ec) {
-//       warn("couldn't read file: {}", ec.message());
-//       continue;
-//     }
-//
-//     std::string path = entry.path().string();
-//
-//     EntryKind kind;
-//     uint64_t data_len = 0;
-//     fs::file_status status = entry.status();
-//     if (fs::is_regular_file(status)) {
-//       kind = EntryKind::File;
-//       data_len = entry.file_size();
-//     } else if (fs::is_directory(status)) {
-//       kind = EntryKind::Directory;
-//     } else {
-//       warn("ignoring unknown file kind: {}", path);
-//       continue;
-//     }
-//
-//     if (!write_exact(conn.in_fd, reinterpret_cast<uint8_t*>(&kind), sizeof(kind)))
-//       return false;
-//
-//     uint64_t path_len = path.size();
-//     if (path_len > std::numeric_limits<uint16_t>::max())
-//       fatal("path of length {} is too long", data_len);
-//
-//     uint64_t lens = (data_len << 16) | (path_len & 0xFFFF);
-//
-//     if (!write_exact(conn.in_fd, reinterpret_cast<uint8_t*>(&lens), sizeof(lens)))
-//       return false;
-//
-//     if (!write_exact(conn.in_fd, reinterpret_cast<uint8_t*>(path.data()), path_len))
-//       return false;
-//
-//     if (kind == EntryKind::File) {
-//       int fd = open(path.c_str(), O_RDONLY);
-//       if (fd == -1) {
-//         warn("open({}): {}", path, strerror(errno));
-//         continue;
-//       }
-//
-//       size_t n_read = 0;
-//       while (n_read < data_len) {
-//         IOResult r = read_partial(fd, buf.get(), CHUNK_SIZE);
-//         if (!r || !write_exact(conn.in_fd, buf.get(), r.n_bytes)) {
-//           close(fd);
-//           return false;
-//         }
-//         n_read += r.n_bytes;
-//         pg.tick(CHUNK_SIZE);
-//       }
-//
-//       close(fd);
-//     }
-//   }
-//
-//   return true;
-// }
-//
-// static bool sync_initial(SSH conn) {
-//   uint8_t version = 1;
-//   if (!write_exact(conn.in_fd, &version, sizeof(version)))
-//     return false;
-//
-//   return true;
-// }
-//
-// static bool receiver_loop() {
-//   uint8_t version;
-//   if (!read_exact(STDIN_FILENO, &version, sizeof(version)))
-//     return false;
-//   assert(version == 1);
-//   std::println(stderr, "established v{}", version);
-//
-//   auto buf = std::make_unique<uint8_t[]>(CHUNK_SIZE);
-//
-//   while (true) {
-//     EntryKind kind;
-//     if (!read_exact(STDIN_FILENO, reinterpret_cast<uint8_t*>(&kind), sizeof(kind)))
-//       return false;
-//
-//     uint64_t lens;
-//     if (!read_exact(STDIN_FILENO, reinterpret_cast<uint8_t*>(&lens), sizeof(lens)))
-//       return false;
-//     uint64_t path_len = lens & 0xFFFF;
-//     uint64_t data_len = lens >> 16;
-//
-//     std::string path(path_len, '\0');
-//     if (!read_exact(STDIN_FILENO, reinterpret_cast<uint8_t*>(path.data()), path_len))
-//       return false;
-//
-//     if (kind == EntryKind::File) {
-//       size_t n_read = 0;
-//       while (n_read < data_len) {
-//         IOResult r = read_partial(STDIN_FILENO, buf.get(), CHUNK_SIZE);
-//         if (!r)
-//           return false;
-//         n_read += r.n_bytes;
-//       }
-//     }
-//   }
-//
-//   return true;
-// }
-//
-// static void watch_dir(const Args& arg) {
-//   using namespace watcher;
-//   Watcher watcher(arg.path, arg.latency);
-//   watcher.run_in_thread([](FsEvent e) {
-//     std::string_view k;
-//     switch (e.kind) {
-//       case FsEventKind::created:
-//         k = "created";
-//         break;
-//       case FsEventKind::deleted:
-//         k = "deleted";
-//         break;
-//       case FsEventKind::modify:
-//         k = "modify";
-//         break;
-//       case FsEventKind::meta:
-//         k = "meta";
-//         break;
-//       case FsEventKind::moved:
-//         k = "moved";
-//         break;
-//       case FsEventKind::sync:
-//         k = "sync";
-//         break;
-//       case FsEventKind::unrecoverable:
-//         k = "unrecoverable";
-//         break;
-//     }
-//     std::println("notification! kind: {}, path: {}, dest: {}", k, e.path, e.dest);
-//   });
-// }
-//
-// int main(int argc, const char* argv[]) {
-//   Args arg = Args::parse(argc, argv);
-//
-//   if (arg.path.empty()) {
-//     arg.path = fs::current_path().string();
-//   } else {
-//     arg.path = fs::absolute(arg.path);
-//
-//     if (!fs::is_directory(arg.path))
-//       fatal("path {} is not a valid directory", arg.path);
-//   }
-//
-//   // Ignore "closed on pipe" signal.
-//   signal(SIGPIPE, SIG_IGN);
-//
-//   if (!arg.daemon) {
-//     SSH conn = run_ssh_process(
-//       "ssh",
-//       "-t",
-//       "-o",
-//       "ServerAliveCountMax=3",
-//       "-o",
-//       "ServerAliveInterval=60",
-//       "-o",
-//       "ExitOnForwardFailure=yes",
-//       arg.user_host.c_str(),
-//       "exec enu --daemon");
-//
-//     watch_dir(arg);
-//
-//     {
-//       // Start scanning dir to figure out the total number of bytes we have to end up
-//       transferring. ProgressBar pg; std::jthread scan_t = scan_dir_size(arg.path, pg);
-//
-//       if (!sync_initial(conn)) {
-//         error("handshake error");
-//         report_stderr_remote(conn);
-//         return 1;
-//       }
-//
-//       if (!sync_to_remote(conn, arg.path, pg)) {
-//         error("syncing error");
-//         report_stderr_remote(conn);
-//         return 1;
-//       }
-//
-//       scan_t.join();
-//     }
-//
-//     int exit_code = conn.wait_on();
-//     if (exit_code != 0) {
-//       error("something went wrong remotely");
-//       report_stderr_remote(conn);
-//       return exit_code;
-//     }
-//   } else {
-//     receiver_loop();
-//   }
-// }
-
-#include <chrono>
-#include <string>
-#include <thread>
+#include "argparser.h"
+#include "log.h"
 #include "tree_progress.h"
+#include "watcher.h"
+
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <algorithm>
+#include <cassert>
+#include <cstring>
+#include <filesystem>
+#include <limits>
+#include <print>
+#include <queue>
+#include <thread>
 
 using namespace enu;
 
-int main() {
-  ProgressNode root{"Build Project"};
+struct Process {
+  pid_t pid;
+  int in_fd;
+  int out_fd;
+  int err_fd;
 
-  ProgressNodeRef compile = root.add_child("Compile modules", 5);
-  ProgressNodeRef link = root.add_child("Link", 10);
-  ProgressNodeRef tests = root.add_child("Run tests", 20);
+  int wait_on() {
+    int status = 0;
 
-  ProgressNodeRef t2 = tests->add_child("LOL", 10);
+    if (waitpid(pid, &status, 0) == -1)
+      return 1;
 
-  for (size_t i = 1; i <= 5; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    compile->tick(1);
+    if (WIFEXITED(status))
+      return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+      return 128 + WTERMSIG(status);
+    return status;
   }
-  compile->finish();
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(350));
-  link->tick(10);
-  link->finish();
+  template <typename... Args>
+  static Process spawn(const char* prog, Args&&... args) {
+    int to[2], from[2], err[2];
+    if (pipe(to) == -1 || pipe(from) == -1 || pipe(err) == -1)
+      fatal("{}", strerror(errno));
 
-  for (size_t i = 1; i <= 20; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    tests->tick(1);
+    pid_t pid = fork();
+    if (pid < 0)
+      fatal("{}", strerror(errno));
+
+    if (pid == 0) {
+      // child
+      dup2(to[0], STDIN_FILENO);
+      dup2(from[1], STDOUT_FILENO);
+      dup2(err[1], STDERR_FILENO);
+
+      close(to[0]);
+      close(to[1]);
+      close(from[0]);
+      close(from[1]);
+      close(err[0]);
+      close(err[1]);
+
+      execlp(prog, prog, std::forward<Args>(args)..., nullptr);
+      _exit(errno);
+    }
+
+    // parent
+    close(to[0]);
+    close(from[1]);
+    close(err[1]);
+
+    return {pid, to[1], from[0], err[0]};
   }
-  tests->finish();
+};
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(350));
-  root.finish();
-  // paint.join();
-  return 0;
+struct [[gnu::packed]] StreamHeader {
+  uint8_t version = 1;
+};
+
+struct [[gnu::packed]] MessageHeader {
+  fs::perms perms;
+  fs::file_type ftype;
+  uint64_t lens; // 16-bits of path_len, 48-bits of fsize
+};
+
+enum class IOKind {
+  Ok,
+  Fail,
+};
+
+struct IOResult {
+  IOKind kind = IOKind::Ok;
+  size_t n_bytes = 0;
+
+  operator bool() {
+    return kind != IOKind::Fail;
+  }
+};
+
+static IOResult write_partial(int fd, const void* buf, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t b_wrote = write(fd, reinterpret_cast<const uint8_t*>(buf) + off, len - off);
+    if (b_wrote == 0)
+      break;
+    if (b_wrote < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        continue;
+      return {IOKind::Fail, off};
+    }
+    off += b_wrote;
+  }
+  return {IOKind::Ok, off};
+}
+
+static IOResult write_exact(int fd, const void* buf, size_t len) {
+  IOResult r = write_partial(fd, buf, len);
+  if (r.n_bytes != len)
+    r.kind = IOKind::Fail;
+  return r;
+}
+
+static IOResult read_partial(int fd, void* buf, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t b_read = read(fd, reinterpret_cast<uint8_t*>(buf) + off, len - off);
+    if (b_read == 0)
+      break;
+    if (b_read < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        continue;
+      return {IOKind::Fail, off};
+    }
+    off += b_read;
+  }
+  return {IOKind::Ok, off};
+}
+
+static IOResult read_exact(int fd, void* buf, size_t len) {
+  IOResult r = read_partial(fd, buf, len);
+  if (r.n_bytes != len)
+    r.kind = IOKind::Fail;
+  return r;
+}
+
+const size_t CHUNK_SIZE = 16 * 1024;
+
+void report_stderr_remote(Process proc) {
+  bool header_printed = false;
+  auto buf = std::make_unique<uint8_t[]>(CHUNK_SIZE);
+
+  while (true) {
+    IOResult r = read_partial(proc.err_fd, buf.get(), CHUNK_SIZE);
+    if (r.n_bytes == 0)
+      break;
+    if (!header_printed) {
+      std::print("\x1b[J");
+      std::println(stderr, "=================================================================");
+      std::println(stderr, "REMOTE ERROR:");
+      header_printed = true;
+    }
+    if (!r) {
+      std::println(stderr, "connection closed prematurely (any possible errors lost)");
+      break;
+    }
+    write_exact(STDERR_FILENO, buf.get(), r.n_bytes);
+  }
+
+  if (header_printed)
+    std::println(stderr, "=================================================================");
+}
+
+struct M {
+  std::string name;
+  fs::perms perms;
+  fs::file_type ftype;
+  uint64_t fsize = 0;
+
+  explicit M(const fs::path& path) {
+    std::error_code ec;
+    fs::file_status status = fs::status(path, ec);
+
+    name = path.filename();
+    perms = status.permissions();
+    ftype = status.type();
+    if (ftype == fs::file_type::regular)
+      fsize = fs::file_size(path, ec);
+  };
+};
+
+template <>
+struct std::formatter<fs::file_type> : std::formatter<std::string_view> {
+  template <class FormatCtx>
+  auto format(fs::file_type t, FormatCtx& ctx) const {
+    std::string_view name;
+    switch (t) {
+      case fs::file_type::none:
+        name = "none";
+        break;
+      case fs::file_type::not_found:
+        name = "not_found";
+        break;
+      case fs::file_type::regular:
+        name = "regular";
+        break;
+      case fs::file_type::directory:
+        name = "directory";
+        break;
+      case fs::file_type::symlink:
+        name = "symlink";
+        break;
+      case fs::file_type::block:
+        name = "block";
+        break;
+      case fs::file_type::character:
+        name = "character";
+        break;
+      case fs::file_type::fifo:
+        name = "fifo";
+        break;
+      case fs::file_type::socket:
+        name = "socket";
+        break;
+      case fs::file_type::unknown:
+        name = "unknown";
+        break;
+      default:
+        name = "invalid";
+        break;
+    }
+    return std::formatter<std::string_view>::format(name, ctx);
+  }
+};
+
+constexpr std::string_view SYNC_ON = "\x1b[?2026h";
+constexpr std::string_view SYNC_OFF = "\x1b[?2026l";
+constexpr std::string_view ERASE_TO_END = "\x1b[J";
+
+static size_t term_height() {
+  winsize ws;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row)
+    return ws.ws_row - 1;
+  return 23; // Fallback.
+}
+
+static size_t display_progress(ProgressNode<M>* root, double elapsed_s) {
+  const size_t COL_START = 57;
+  const size_t BAR_WIDTH = 40;
+
+  std::string out;
+  size_t line_count = 0;
+  size_t max_rows = term_height();
+
+  auto total_stats = [&](size_t done, size_t total) {
+    double ratio = total ? static_cast<double>(done) / total : 1.0;
+    size_t filled = static_cast<size_t>(ratio * BAR_WIDTH);
+
+    auto [done_val, done_unit] = scale(static_cast<double>(done));
+    auto [speed_val, speed_unit] = scale(elapsed_s > 0.0 ? done / elapsed_s : 0.0);
+
+    const std::string_view FRAMES[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+    size_t selector = static_cast<size_t>(elapsed_s * 8.0);
+    std::string_view sym = FRAMES[(selector) % (sizeof(FRAMES) / sizeof(*FRAMES))];
+
+    return std::format(
+      "[{}{}] [{:5.1f}% {:5.1f} {} {:5.1f} {}/s ] {}\n",
+      std::string(filled, '='),
+      std::string(BAR_WIDTH - filled, ' '),
+      std::min(100.0, ratio * 100.0),
+      done_val,
+      done_unit,
+      speed_val,
+      speed_unit,
+      sym);
+  };
+
+  auto node_stats = [](size_t done, size_t total) {
+    if (total == 0)
+      return std::string("\n");
+    const double PCT = total ? 100. * done / total : 100.;
+    auto [done_val, done_unit] = scale(static_cast<double>(done));
+    if (done < 1024)
+      return std::format("[{:5.1f}% {:5.0f}{:3}]\n", PCT, done_val, done_unit);
+    else
+      return std::format("[{:5.1f}% {:5.1f}{:3}]\n", PCT, done_val, done_unit);
+  };
+
+  auto visit = [&](const auto& self, ProgressNode<M>* node, std::string prefix, bool last) {
+    // Too many line to fit in terminal window.
+    if (line_count + 1 == max_rows)
+      return;
+
+    if (!node->is_root()) {
+      out += prefix;
+      // out += last ? "+- " : "|- ";
+      // prefix += last ? "   " : "|  ";
+      // Utf-8 versions:
+      out += last ? "└─ " : "├─ ";
+      prefix += last ? "   " : "│  ";
+    }
+
+    // FIXME: proper utf8
+    auto utf8_size = [](const char* s) {
+      size_t len = 0;
+      while (*s)
+        len += (*s++ & 0xc0) != 0x80;
+      return len;
+    };
+
+    size_t prefix_size = utf8_size(prefix.c_str());
+
+    std::string_view text = node->meta.name;
+    out += text;
+
+    if (prefix_size + text.size() >= COL_START) {
+      out += ' ';
+    } else {
+      size_t pad = COL_START - (prefix_size + text.size());
+      out.append(pad, ' ');
+    }
+
+    out += node_stats(node->done(), node->total());
+    ++line_count;
+
+    size_t idx = 0;
+    node->iter_children([&](ProgressNode<M>* child) {
+      ++idx;
+      self(self, child, prefix, idx == node->child_count());
+    });
+  };
+
+  visit(visit, root, "", true);
+
+  out += total_stats(root->sum_done(), root->sum_total());
+  ++line_count;
+
+  std::print(SYNC_ON);
+  std::print(ERASE_TO_END);
+  std::print("{}", out);
+  // Move cursor to top of frame
+  if (line_count > 0)
+    std::print("\033[{}A", line_count);
+  std::print(SYNC_OFF);
+  std::fflush(stdout);
+
+  return line_count;
+}
+
+void clear_progress(ProgressNode<M>* root) {
+  // Can't use std::print here because we require async signal safety.
+  write(STDOUT_FILENO, SYNC_ON.data(), SYNC_ON.size());
+  write(STDOUT_FILENO, ERASE_TO_END.data(), ERASE_TO_END.size());
+  write(STDOUT_FILENO, SYNC_OFF.data(), SYNC_OFF.size());
+}
+
+std::string str_to_lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+  return s;
+}
+
+static std::jthread scan_dir(const fs::path& root_path, ProgressNode<M>* root_node) {
+  return std::jthread{[root_path, root_node] {
+    std::vector<std::pair<fs::path, ProgressNode<M>*>> stack;
+    stack.emplace_back(root_path, root_node);
+
+    while (!stack.empty()) {
+      auto [path, node] = std::move(stack.back());
+      stack.pop_back();
+
+      std::error_code ec;
+      std::vector<M> entries;
+      for (const fs::directory_entry& entry : fs::directory_iterator(path, ec)) {
+        if (ec) {
+          error("{}", str_to_lower(ec.message()));
+          continue;
+        }
+
+        M meta = M{std::move(entry.path())};
+        entries.emplace_back(meta);
+      }
+
+      std::sort(entries.begin(), entries.end(), [](const M& a, const M& b) {
+        if (a.ftype == fs::file_type::regular && b.ftype == fs::file_type::regular)
+          // Sort by smallest size, to ensure we send the smallest files first.
+          return a.fsize < b.fsize;
+        else
+          // Otherwise sort by alphanumeric.
+          return a.name < b.name;
+      });
+
+      for (M meta : entries) {
+        switch (meta.ftype) {
+          case fs::file_type::directory: {
+            fs::path sub_path = fs::path{path / meta.name};
+
+            ProgressNode<M>* child = node->add_child(meta);
+            stack.emplace_back(sub_path, child);
+            break;
+          }
+          case fs::file_type::regular: {
+            ProgressNode<M>* child = node->add_child(meta);
+            child->shift_total(child->meta.fsize);
+            child->unlock();
+            break;
+          }
+          default:
+            fs::path sub_path = fs::path{path / meta.name};
+            warn("{}: {} file type ignored", sub_path.native(), meta.ftype);
+            break;
+        }
+      }
+
+      node->unlock();
+    }
+  }};
+}
+
+bool send_message(int in_fd, const fs::path& base, const fs::path& path, ProgressNode<M>* node) {
+  const M& meta = node->meta;
+
+  std::error_code ec;
+  fs::path rel_path = fs::relative(path, base, ec);
+  if (ec)
+    fatal("{}: {}", path.native(), str_to_lower(ec.message()));
+
+  uint64_t rel_path_len = rel_path.native().size();
+  if (rel_path_len > std::numeric_limits<std::uint16_t>::max()) {
+    warn("path of length {} is too long", rel_path_len);
+    return false;
+  }
+
+  uint64_t fsize = meta.fsize;
+  uint64_t lens = (fsize << 16) | rel_path_len;
+  MessageHeader hdr{meta.perms, meta.ftype, lens};
+
+  if (!write_exact(in_fd, &hdr, sizeof(MessageHeader)))
+    return false;
+
+  if (!write_exact(in_fd, rel_path.c_str(), rel_path_len))
+    return false;
+
+  if (meta.ftype != fs::file_type::regular || fsize == 0)
+    return true;
+
+  int out_fd = open(path.c_str(), O_RDONLY);
+  if (out_fd == -1)
+    fatal("open({}): {}", path.native(), strerror(errno));
+
+  void* map = mmap(nullptr, meta.fsize, PROT_READ, MAP_PRIVATE, out_fd, 0);
+  if (map == MAP_FAILED)
+    fatal("mmap({}): {}", path.native(), strerror(errno));
+
+  size_t n_sent = 0;
+  while (n_sent < fsize) {
+    size_t chunk = std::min(CHUNK_SIZE, static_cast<size_t>(fsize) - n_sent);
+    IOResult r = write_partial(in_fd, reinterpret_cast<uint8_t*>(map) + n_sent, chunk);
+    if (!r || r.n_bytes == 0) {
+      close(out_fd);
+      return false;
+    }
+    n_sent += r.n_bytes;
+    node->tick(r.n_bytes);
+  }
+
+  close(out_fd);
+  return true;
+};
+
+static bool sync_with_remote(Process proc, const fs::path& root, ProgressNode<M>* root_node) {
+  StreamHeader hdr{1};
+  if (!write_exact(proc.in_fd, &hdr, sizeof hdr))
+    return false;
+
+  fs::path base = root.parent_path();
+
+  std::queue<std::pair<fs::path, ProgressNode<M>*>> q;
+  std::unordered_map<ProgressNode<M>*, size_t> pending; // Remaining direct children.
+
+  auto bubble = [&](ProgressNode<M>* node) {
+    while (node) {
+      auto it = pending.find(node);
+      size_t& left = it->second;
+      if (--left == 0) {
+        ProgressNode<M>* tmp = node->parent;
+        node->remove();
+        pending.erase(it);
+        node = tmp;
+      } else {
+        break;
+      }
+    }
+  };
+
+  q.emplace(root, root_node);
+
+  while (!q.empty()) {
+    auto [path, node] = q.front();
+    q.pop();
+
+    if (!send_message(proc.in_fd, base, path, node))
+      return false;
+
+    if (node->meta.ftype == fs::file_type::regular) {
+      ProgressNode<M>* parent = node->parent;
+      node->remove();
+      bubble(parent);
+    } else {
+      size_t count = 0;
+      node->iter_children([&](ProgressNode<M>* child) {
+        fs::path sub = path / child->meta.name;
+        ++count;
+        q.emplace(sub, child);
+      });
+      if (count == 0) { // Empty directory
+        ProgressNode<M>* parent = node->parent;
+        node->remove();
+        bubble(parent);
+      } else {
+        pending[node] = count;
+      }
+    }
+  }
+  return true;
+}
+
+int create_file(std::string_view path, size_t size) {
+  int fd = open(path.data(), O_RDWR | O_CREAT);
+  if (fd == -1) {
+    error("open({}): {}", path, strerror(errno));
+    return -1;
+  }
+
+  if (ftruncate(fd, size) == -1) {
+    error("ftruncate({}): {}", path, strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
+static bool recv_message(int in_fd) {
+  MessageHeader hdr;
+  if (!read_exact(in_fd, &hdr, sizeof(MessageHeader)))
+    return false;
+
+  uint64_t path_len = hdr.lens & 0xFFFF;
+  std::string path(path_len, '\0');
+  if (!read_exact(in_fd, path.data(), path_len))
+    return false;
+
+  std::error_code ec;
+  switch (hdr.ftype) {
+    case fs::file_type::regular: {
+      uint64_t fsize = hdr.lens >> 16;
+
+      int out_fd = create_file(path, fsize);
+      if (out_fd == -1)
+        return false;
+
+      if (fsize > 0) { // Important as mmap(..) will fail on mapping 0-sized files.
+        void* map = mmap(nullptr, fsize, PROT_WRITE, MAP_SHARED, out_fd, 0);
+        if (map == MAP_FAILED)
+          fatal("mmap({}): {}", path, strerror(errno));
+
+        if (!read_exact(in_fd, map, fsize)) {
+          close(out_fd);
+          return false;
+        }
+      }
+      break;
+    }
+    case fs::file_type::directory: {
+      bool created = fs::create_directory(path, ec);
+      if (ec) {
+        error("{}: {}", path, str_to_lower(ec.message()));
+        return false;
+      }
+      if (!created)
+        fatal("directory already exists: {}", path);
+      break;
+    }
+    default:
+      break;
+  }
+
+  std::filesystem::permissions(path, hdr.perms, std::filesystem::perm_options::add, ec);
+  if (ec) {
+    warn("{}: {}", path, str_to_lower(ec.message()));
+    return true;
+  }
+
+  return true;
+}
+
+static bool sync_from_remote() {
+  int in_fd = STDIN_FILENO;
+
+  StreamHeader hdr;
+  if (!read_exact(in_fd, &hdr, sizeof(StreamHeader)))
+    return false;
+  if (hdr.version != 1)
+    fatal("version mismatch");
+
+  while (true) {
+    if (!recv_message(in_fd))
+      return false;
+  }
+
+  return true;
+}
+
+static void watch_dir(const Args& arg) {
+  using namespace watcher;
+  Watcher watcher(arg.path, arg.latency);
+  watcher.run_in_thread([](FsEvent e) {
+    std::string_view k;
+    switch (e.kind) {
+      case FsEventKind::created:
+        k = "created";
+        break;
+      case FsEventKind::deleted:
+        k = "deleted";
+        break;
+      case FsEventKind::modify:
+        k = "modify";
+        break;
+      case FsEventKind::meta:
+        k = "meta";
+        break;
+      case FsEventKind::moved:
+        k = "moved";
+        break;
+      case FsEventKind::sync:
+        k = "sync";
+        break;
+      case FsEventKind::unrecoverable:
+        k = "unrecoverable";
+        break;
+    }
+    info("notification! kind: {}, path: {}, dest: {}", k, e.path, e.dest);
+  });
+}
+
+int main(int argc, const char* argv[]) {
+  Args arg = Args::parse(argc, argv);
+
+  std::error_code ec;
+  if (arg.path.empty()) {
+    arg.path = fs::current_path(ec);
+    if (ec)
+      fatal("{}", str_to_lower(ec.message()));
+  } else {
+    fs::path path = fs::canonical(arg.path, ec);
+    if (ec)
+      fatal("{}: {}", arg.path.native(), str_to_lower(ec.message()));
+    arg.path = path;
+
+    if (!fs::is_directory(arg.path, ec))
+      fatal("{} is not a directory", arg.path.native());
+    if (ec)
+      fatal("{}", str_to_lower(ec.message()));
+  }
+
+  // Ignore "closed pipe" signal.
+  signal(SIGPIPE, SIG_IGN);
+
+  if (!arg.daemon) {
+    Process proc = Process::spawn(
+      "ssh",
+      "-o",
+      "ServerAliveCountMax=3",
+      "-o",
+      "ServerAliveInterval=60",
+      "-o",
+      "ExitOnForwardFailure=yes",
+      arg.user_host.c_str(),
+      "exec enu --daemon");
+
+    watch_dir(arg);
+
+    {
+      static ProgressNode<M> root_node{M{arg.path}, display_progress};
+      signal(SIGINT, [](int) { clear_progress(&root_node); });
+
+      std::jthread scan_thread = scan_dir(arg.path, &root_node);
+
+      if (!sync_with_remote(proc, arg.path, &root_node)) {
+        error("syncing error");
+        clear_progress(&root_node);
+        report_stderr_remote(proc);
+        return 1;
+      }
+
+      signal(SIGINT, SIG_DFL);
+      clear_progress(&root_node);
+    }
+
+    int exit_code = proc.wait_on();
+    if (exit_code != 0) {
+      error("something went wrong remotely");
+      report_stderr_remote(proc);
+      return exit_code;
+    }
+  } else {
+    sync_from_remote();
+  }
 }
