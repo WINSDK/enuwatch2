@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <print>
 
+namespace fs = std::filesystem;
+
 namespace enu::log {
 
 void print(Level level, Loc loc, std::string_view args) {
@@ -26,7 +28,7 @@ void print(Level level, Loc loc, std::string_view args) {
       break;
   };
 
-  std::filesystem::path path{loc.fpath};
+  fs::path path{loc.fpath};
   std::string filename = path.filename();
   std::chrono::time_point time = std::chrono::system_clock::now();
 

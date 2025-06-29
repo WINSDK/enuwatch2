@@ -490,10 +490,10 @@ static bool sync_with_remote(Process proc, const fs::path& root, TrackedNode<M>*
       auto it = pending.find(node);
       size_t& left = it->second;
       if (--left == 0) {
-        TrackedNode<M>* tmp = node->parent;
+        TrackedNode<M>* parent = node->parent;
         node->remove();
         pending.erase(it);
-        node = tmp;
+        node = parent;
       } else {
         break;
       }
@@ -593,7 +593,7 @@ static bool recv_message(int in_fd) {
       break;
   }
 
-  std::filesystem::permissions(path, hdr.perms, std::filesystem::perm_options::add, ec);
+  fs::permissions(path, hdr.perms, fs::perm_options::add, ec);
   if (ec) {
     warn("{}: {}", path, str_to_lower(ec.message()));
     return true;
