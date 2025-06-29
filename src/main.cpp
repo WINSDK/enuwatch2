@@ -97,19 +97,24 @@ struct IOResult {
   size_t n_bytes = 0;
 
   operator bool() {
-    return kind != IOKind::Fail;
+    return kind == IOKind::Ok;
   }
 };
+
+const size_t MAX_RW_SIZE = std::numeric_limits<int>::max();
 
 static IOResult write_partial(int fd, const void* buf, size_t len) {
   size_t off = 0;
   while (off < len) {
-    ssize_t b_wrote = write(fd, reinterpret_cast<const uint8_t*>(buf) + off, len - off);
+    // read/write's can operate on `INT_MAX` bytes at a time.
+    size_t chunk = std::min(MAX_RW_SIZE, len - off);
+    ssize_t b_wrote = write(fd, reinterpret_cast<const uint8_t*>(buf) + off, chunk);
     if (b_wrote == 0)
       break;
     if (b_wrote < 0) {
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
         continue;
+      error("write({}): {}", fd, strerror(errno));
       return {IOKind::Fail, off};
     }
     off += b_wrote;
@@ -127,12 +132,14 @@ static IOResult write_exact(int fd, const void* buf, size_t len) {
 static IOResult read_partial(int fd, void* buf, size_t len) {
   size_t off = 0;
   while (off < len) {
-    ssize_t b_read = read(fd, reinterpret_cast<uint8_t*>(buf) + off, len - off);
+    size_t chunk = std::min(MAX_RW_SIZE, len - off);
+    ssize_t b_read = read(fd, reinterpret_cast<uint8_t*>(buf) + off, chunk);
     if (b_read == 0)
       break;
     if (b_read < 0) {
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
         continue;
+      error("read({}): {}", fd, strerror(errno));
       return {IOKind::Fail, off};
     }
     off += b_read;
@@ -509,9 +516,9 @@ static bool sync_with_remote(Process proc, const fs::path& root, TrackedNode<M>*
     } else {
       size_t count = 0;
       node->iter_children([&](TrackedNode<M>* child) {
-        fs::path sub = path / child->meta.name;
+        fs::path sub_path = path / child->meta.name;
+        q.emplace(sub_path, child);
         ++count;
-        q.emplace(sub, child);
       });
       if (count == 0) { // Empty directory
         TrackedNode<M>* parent = node->parent;
