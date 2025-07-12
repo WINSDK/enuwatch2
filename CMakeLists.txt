@@ -10,6 +10,14 @@ endif()
 
 option(ENU_TEST "Build tests" OFF)
 
+if (NOT ENU_TEST)
+    set(BUILD_SHARED_LIBS OFF)
+    set(TBB_TEST OFF CACHE INTERNAL "")
+    set(TBB_STRICT OFF CACHE INTERNAL "")
+    add_subdirectory(third-party/tbb EXCLUDE_FROM_ALL)
+    target_compile_definitions(tbb PRIVATE __TBB_DYNAMIC_LOAD_ENABLED=0)
+endif()
+
 add_subdirectory("src/")
 
 if (ENU_TEST)

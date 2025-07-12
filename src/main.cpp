@@ -1,5 +1,7 @@
 #include "argparser.h"
 #include "log.h"
+#include "net.h"
+#include "sequencer.h"
 #include "tracked.h"
 #include "watcher.h"
 
@@ -9,15 +11,22 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/stdio.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <tbb/concurrent_hash_map.h>
+#include <tbb/enumerable_thread_specific.h>
+#include <tbb/task_group.h>
+#include <unistd.h>
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <print>
-#include <queue>
 #include <thread>
 
 using namespace enu;
@@ -28,7 +37,7 @@ struct Process {
   int out_fd;
   int err_fd;
 
-  int wait_on() {
+  int wait_on() const {
     int status = 0;
 
     if (waitpid(pid, &status, 0) == -1)
@@ -45,11 +54,11 @@ struct Process {
   static Process spawn(const char* prog, Args&&... args) {
     int to[2], from[2], err[2];
     if (pipe(to) == -1 || pipe(from) == -1 || pipe(err) == -1)
-      fatal("{}", strerror(errno));
+      pfatal("pipe()");
 
     pid_t pid = fork();
     if (pid < 0)
-      fatal("{}", strerror(errno));
+      pfatal("fork()");
 
     if (pid == 0) {
       // child
@@ -75,84 +84,21 @@ struct Process {
 
     return {pid, to[1], from[0], err[0]};
   }
+
+  ~Process() {
+    if (pid)
+      kill(SIGTERM, pid);
+  }
 };
 
-struct [[gnu::packed]] StreamHeader {
-  uint8_t version = 1;
-};
-
-struct [[gnu::packed]] MessageHeader {
+struct DataMessage {
+  uint32_t seq;
   fs::perms perms;
   fs::file_type ftype;
-  uint64_t lens; // 16-bits of path_len, 48-bits of fsize
+  uint16_t path_len;
+  uint64_t fsize;
+  char data[];
 };
-
-enum class IOKind {
-  Ok,
-  Fail,
-};
-
-struct IOResult {
-  IOKind kind = IOKind::Ok;
-  size_t n_bytes = 0;
-
-  operator bool() {
-    return kind == IOKind::Ok;
-  }
-};
-
-const size_t MAX_RW_SIZE = std::numeric_limits<int>::max();
-
-static IOResult write_partial(int fd, const void* buf, size_t len) {
-  size_t off = 0;
-  while (off < len) {
-    // read/write's can operate on `INT_MAX` bytes at a time.
-    size_t chunk = std::min(MAX_RW_SIZE, len - off);
-    ssize_t b_wrote = write(fd, reinterpret_cast<const uint8_t*>(buf) + off, chunk);
-    if (b_wrote == 0)
-      break;
-    if (b_wrote < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-        continue;
-      error("write({}): {}", fd, strerror(errno));
-      return {IOKind::Fail, off};
-    }
-    off += b_wrote;
-  }
-  return {IOKind::Ok, off};
-}
-
-static IOResult write_exact(int fd, const void* buf, size_t len) {
-  IOResult r = write_partial(fd, buf, len);
-  if (r.n_bytes != len)
-    r.kind = IOKind::Fail;
-  return r;
-}
-
-static IOResult read_partial(int fd, void* buf, size_t len) {
-  size_t off = 0;
-  while (off < len) {
-    size_t chunk = std::min(MAX_RW_SIZE, len - off);
-    ssize_t b_read = read(fd, reinterpret_cast<uint8_t*>(buf) + off, chunk);
-    if (b_read == 0)
-      break;
-    if (b_read < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-        continue;
-      error("read({}): {}", fd, strerror(errno));
-      return {IOKind::Fail, off};
-    }
-    off += b_read;
-  }
-  return {IOKind::Ok, off};
-}
-
-static IOResult read_exact(int fd, void* buf, size_t len) {
-  IOResult r = read_partial(fd, buf, len);
-  if (r.n_bytes != len)
-    r.kind = IOKind::Fail;
-  return r;
-}
 
 const size_t CHUNK_SIZE = 16 * 1024;
 
@@ -284,16 +230,15 @@ static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
     size_t selector = static_cast<size_t>(elapsed_s * 8.0);
     std::string_view sym = X[selector % X.size()];
 
-    return std::format(
-      "[{}{}] [{:5.1f}% {:5.1f} {} {:5.1f} {}/s ] {}\n",
-      std::string(filled, '='),
-      std::string(BAR_WIDTH - filled, ' '),
-      std::min(100.0, ratio * 100.0),
-      done_val,
-      done_unit,
-      speed_val,
-      speed_unit,
-      sym);
+    return std::format("[{}{}] [{:5.1f}% {:5.1f} {} {:5.1f} {}/s ] {}\n",
+                       std::string(filled, '='),
+                       std::string(BAR_WIDTH - filled, ' '),
+                       std::min(100.0, ratio * 100.0),
+                       done_val,
+                       done_unit,
+                       speed_val,
+                       speed_unit,
+                       sym);
   };
 
   auto node_stats = [](size_t done, size_t total) {
@@ -307,7 +252,7 @@ static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
       return std::format("[{:5.1f}% {:5.1f}{:3}]\n", PCT, done_val, done_unit);
   };
 
-  auto visit = [&](const auto& self, TrackedNode<M>* node, std::string p, size_t p_len, bool last) {
+  auto visit = [&](const auto& f, TrackedNode<M>* node, std::string p, size_t p_len, bool last) {
     // stop when we’re out of vertical space
     if (line_count + 1 == max_rows)
       return;
@@ -334,7 +279,7 @@ static size_t display_progress(TrackedNode<M>* root, double elapsed_s) {
     size_t idx = 0;
     node->iter_children([&](TrackedNode<M>* child) {
       ++idx;
-      self(self, child, p, p_len, idx == node->child_count());
+      f(f, child, p, p_len, idx == node->child_count());
     });
   };
 
@@ -423,8 +368,12 @@ static std::jthread scan_dir(const fs::path& root_path, TrackedNode<M>* root_nod
   }};
 }
 
-static bool
-send_message(int in_fd, const fs::path& base, const fs::path& path, TrackedNode<M>* node) {
+static bool send_message(int in_fd,
+                         uint32_t seq,
+                         const fs::path& base,
+                         const fs::path& path,
+                         TrackedNode<M>* node,
+                         const std::atomic<bool>& ok) {
   const M& meta = node->meta;
 
   std::error_code ec;
@@ -438,58 +387,59 @@ send_message(int in_fd, const fs::path& base, const fs::path& path, TrackedNode<
     return false;
   }
 
-  uint64_t fsize = meta.fsize;
-  uint64_t lens = (fsize << 16) | rel_path_len;
-  MessageHeader hdr{meta.perms, meta.ftype, lens};
-
-  if (!write_exact(in_fd, &hdr, sizeof(MessageHeader)))
+  DataMessage hdr{seq, meta.perms, meta.ftype, static_cast<uint16_t>(rel_path_len), meta.fsize};
+  if (!write_exact(in_fd, &hdr, sizeof(hdr)))
     return false;
 
   if (!write_exact(in_fd, rel_path.c_str(), rel_path_len))
     return false;
 
-  if (meta.ftype != fs::file_type::regular || fsize == 0)
-    return true;
+  auto write_file_contents = [&] {
+    int out_fd = open(path.c_str(), O_RDONLY);
+    if (out_fd == -1)
+      fatal("open({})", path.native());
 
-  int out_fd = open(path.c_str(), O_RDONLY);
-  if (out_fd == -1)
-    fatal("open({}): {}", path.native(), strerror(errno));
+    void* map = mmap(nullptr, meta.fsize, PROT_READ, MAP_PRIVATE, out_fd, 0);
+    if (map == MAP_FAILED)
+      fatal("mmap({})", path.native());
 
-  void* map = mmap(nullptr, meta.fsize, PROT_READ, MAP_PRIVATE, out_fd, 0);
-  if (map == MAP_FAILED)
-    fatal("mmap({}): {}", path.native(), strerror(errno));
-
-  size_t n_sent = 0;
-  while (n_sent < fsize) {
-    size_t chunk = std::min(CHUNK_SIZE, static_cast<size_t>(fsize) - n_sent);
-    IOResult r = write_partial(in_fd, reinterpret_cast<uint8_t*>(map) + n_sent, chunk);
-    if (!r || r.n_bytes == 0) {
-      close(out_fd);
-      return false;
+    size_t n_sent = 0;
+    while (n_sent < meta.fsize) {
+      size_t chunk = std::min(CHUNK_SIZE, static_cast<size_t>(meta.fsize) - n_sent);
+      IOResult r = write_partial(in_fd, reinterpret_cast<uint8_t*>(map) + n_sent, chunk);
+      if (!r || r.n_bytes == 0 || !ok) {
+        close(out_fd);
+        return false;
+      }
+      n_sent += r.n_bytes;
+      node->tick(r.n_bytes);
     }
-    n_sent += r.n_bytes;
-    node->tick(r.n_bytes);
-  }
 
-  close(out_fd);
+    close(out_fd);
+    return true;
+  };
+
+  if (meta.ftype == fs::file_type::regular && meta.fsize > 0)
+    if (!write_file_contents())
+      return false;
+
   return true;
 };
 
-static bool sync_with_remote(Process proc, const fs::path& root, TrackedNode<M>* root_node) {
-  StreamHeader hdr{1};
-  if (!write_exact(proc.in_fd, &hdr, sizeof hdr))
-    return false;
-
+static bool sync_with_remote(const fs::path& root,
+                             TrackedNode<M>* root_node,
+                             const Process& seq_proc) {
   fs::path base = root.parent_path();
 
-  std::queue<std::pair<fs::path, TrackedNode<M>*>> q;
-  std::unordered_map<TrackedNode<M>*, size_t> pending; // Remaining direct children.
+  tbb::enumerable_thread_specific<Process> t_proc{};
+  using HashMap = tbb::concurrent_hash_map<TrackedNode<M>*, size_t>;
+  HashMap pending; // Remaining direct children.
 
   auto bubble = [&](TrackedNode<M>* node) {
     while (node) {
-      auto it = pending.find(node);
-      size_t& left = it->second;
-      if (--left == 0) {
+      HashMap::accessor it;
+      pending.find(it, node);
+      if (--it->second == 0) {
         TrackedNode<M>* parent = node->parent;
         node->remove();
         pending.erase(it);
@@ -500,119 +450,176 @@ static bool sync_with_remote(Process proc, const fs::path& root, TrackedNode<M>*
     }
   };
 
-  q.emplace(root, root_node);
+  std::atomic<bool> ok = true;
+  auto report_async_error = [&](const Process& proc) {
+    if (ok.exchange(false))
+      report_stderr_remote(proc);
+  };
 
-  while (!q.empty()) {
-    auto [path, node] = q.front();
-    q.pop();
+  std::atomic<uint32_t> g_seq = 0;
+  std::mutex m_master_proc;
 
-    if (!send_message(proc.in_fd, base, path, node))
-      return false;
+  auto recurse = [&](const auto& f, fs::path path, TrackedNode<M>* node) {
+    if (!ok)
+      return;
 
-    if (node->meta.ftype == fs::file_type::regular) {
-      TrackedNode<M>* parent = node->parent;
-      node->remove();
-      bubble(parent);
-    } else {
-      size_t count = 0;
+    Process& proc = t_proc.local();
+    if (proc.pid == 0) {
+      proc = Process::spawn("ssh",
+                            "-o",
+                            "ExitOnForwardFailure=yes",
+                            "-o",
+                            "ControlMaster=auto",
+                            "-o",
+                            "ControlPath=~/.ssh/%h",
+                            "nicolas@localhost",
+                            "exec /Users/nicolas/Projects/enuwatch/build/src/enu --daemon");
+    }
+
+    uint32_t seq = g_seq.load();
+    g_seq = (g_seq + 1) % std::numeric_limits<uint32_t>::max();
+
+    if (!send_message(proc.in_fd, seq, base, path, node, ok))
+      return report_async_error(proc);
+
+    auto parallel_iter_children = [&] {
+      tbb::task_group tbb;
       node->iter_children([&](TrackedNode<M>* child) {
         fs::path sub_path = path / child->meta.name;
-        q.emplace(sub_path, child);
-        ++count;
+        tbb.run([f, sub_path, child] { f(f, sub_path, child); });
       });
-      if (count == 0) { // Empty directory
+      tbb.wait();
+    };
+
+    switch (node->meta.ftype) {
+      case fs::file_type::regular: {
         TrackedNode<M>* parent = node->parent;
         node->remove();
         bubble(parent);
-      } else {
-        pending[node] = count;
+        break;
       }
-    }
-  }
-  return true;
-}
-
-static int create_file(std::string_view path, size_t size) {
-  int fd = open(path.data(), O_RDWR | O_CREAT);
-  if (fd == -1) {
-    error("open({}): {}", path, strerror(errno));
-    return -1;
-  }
-
-  if (ftruncate(fd, size) == -1) {
-    error("ftruncate({}): {}", path, strerror(errno));
-    close(fd);
-    return -1;
-  }
-
-  return fd;
-}
-
-static bool recv_message(int in_fd) {
-  MessageHeader hdr;
-  if (!read_exact(in_fd, &hdr, sizeof(MessageHeader)))
-    return false;
-
-  uint64_t path_len = hdr.lens & 0xFFFF;
-  std::string path(path_len, '\0');
-  if (!read_exact(in_fd, path.data(), path_len))
-    return false;
-
-  std::error_code ec;
-  switch (hdr.ftype) {
-    case fs::file_type::regular: {
-      uint64_t fsize = hdr.lens >> 16;
-
-      int out_fd = create_file(path, fsize);
-      if (out_fd == -1)
-        return false;
-
-      if (fsize > 0) { // Important as mmap(..) will fail on mapping 0-sized files.
-        void* map = mmap(nullptr, fsize, PROT_WRITE, MAP_SHARED, out_fd, 0);
-        if (map == MAP_FAILED)
-          fatal("mmap({}): {}", path, strerror(errno));
-
-        if (!read_exact(in_fd, map, fsize)) {
-          close(out_fd);
-          return false;
+      case fs::file_type::directory: {
+        size_t count = node->child_count();
+        TrackedNode<M>* parent = node->parent;
+        if (count == 0 && parent) { // Empty directory
+          node->remove();
+          bubble(parent);
+        } else {
+          pending.emplace(node, count);
+          parallel_iter_children();
         }
+        break;
       }
-      break;
+      default:
+        fatal("impossible");
     }
-    case fs::file_type::directory: {
-      bool created = fs::create_directory(path, ec);
-      if (ec) {
-        error("{}: {}", path, str_to_lower(ec.message()));
-        return false;
-      }
-      if (!created)
-        fatal("directory already exists: {}", path);
-      break;
+  };
+
+  recurse(recurse, root, root_node);
+
+  for (const Process& proc : t_proc) {
+    // Stop daemon.
+    kill(proc.pid, SIGTERM);
+
+    // Check if daemon was killed earlier, (I.e. not by the SIGTERM we just sent).
+    int exit_code = proc.wait_on();
+    if (exit_code != 0 && !WTERMSIG(exit_code)) {
+      report_stderr_remote(proc);
+      return false;
     }
-    default:
-      break;
   }
 
-  fs::permissions(path, hdr.perms, fs::perm_options::add, ec);
-  if (ec) {
-    warn("{}: {}", path, str_to_lower(ec.message()));
-    return true;
+  return ok;
+}
+
+static std::vector<std::string> ANON_FILES;
+
+static void register_tempfile_cleanup() {
+  static bool registered = false;
+  if (!registered) {
+    atexit([] {
+      for (std::string_view path : ANON_FILES) {
+        unlink(path.data());
+      }
+    });
+    registered = true;
   }
+};
+
+static std::pair<int, std::string> create_anonfile(size_t fsize, mode_t mode) {
+  register_tempfile_cleanup();
+
+  char template_path[] = "/tmp/enu.XXXXXX";
+  int fd = mkstemp(template_path);
+  if (fd == -1)
+    pfatal("mkstemp({})", fd);
+
+  std::string s_template_path = ANON_FILES.emplace_back(std::string{template_path});
+
+  if (ftruncate(fd, fsize) == -1)
+    pfatal("ftruncate({})", fd);
+
+  return {fd, s_template_path};
+}
+
+static bool copy_to_file(int in_fd, int out_fd, size_t fsize) {
+  // Important as mmap(..) will fail on mapping 0-sized files.
+  if (fsize == 0)
+    return true;
+
+  void* map = mmap(nullptr, fsize, PROT_WRITE, MAP_SHARED, out_fd, 0);
+  if (map == MAP_FAILED)
+    pfatal("mmap({})", out_fd);
+
+  // Connection closed.
+  if (!read_exact(in_fd, map, fsize))
+    return false;
 
   return true;
 }
 
-static bool sync_from_remote() {
-  int in_fd = STDIN_FILENO;
+/*
+Executed on the host machine. One way listener for files/dirs to create
 
-  StreamHeader hdr;
-  if (!read_exact(in_fd, &hdr, sizeof(StreamHeader)))
-    return false;
-  if (hdr.version != 1)
-    fatal("version mismatch");
+1. Read `SequencerMessage` from stdin over SSH connection
+*/
+static bool daemon_main() {
+  int in_fd = STDIN_FILENO;
+  int sock = connect_to_sequencer();
+
+  auto resolve_data_msg = [&](SequencerMessage& seq_msg, size_t fsize) {
+    // Directory creation is passed along to sequencer instead.
+    if (seq_msg.ftype == fs::file_type::regular) {
+      auto mode = static_cast<mode_t>(seq_msg.perms); // Seems fine.
+      auto [out_fd, anon_path] = create_anonfile(fsize, mode);
+
+      if (!copy_to_file(in_fd, out_fd, fsize)) {
+        close(out_fd);
+        return false;
+      }
+
+      // Attach now created file to be moved later.
+      seq_msg.anon_path = anon_path;
+      close(out_fd);
+    }
+
+    return true;
+  };
 
   while (true) {
-    if (!recv_message(in_fd))
+    DataMessage hdr;
+    if (!read_exact(in_fd, &hdr, sizeof(hdr)))
+      return false;
+
+    std::string path(hdr.path_len, '\0');
+    if (!read_exact(in_fd, path.data(), hdr.path_len))
+      return false;
+
+    SequencerMessage seq_msg{hdr.seq, hdr.ftype, hdr.perms, std::move(path)};
+    if (!resolve_data_msg(seq_msg, hdr.fsize))
+      return false;
+
+    if (!write_frame(sock, seq_msg))
       return false;
   }
 
@@ -651,6 +658,48 @@ static void watch_dir(const Args& arg) {
   });
 }
 
+static int enu_main(Args arg) {
+  Process seq_proc =
+    Process::spawn("ssh",
+                   "-o",
+                   "ExitOnForwardFailure=yes",
+                   "-o",
+                   "ControlMaster=yes",
+                   "-o",
+                   "ControlPersist=yes",
+                   "-o",
+                   "ControlPath=~/.ssh/%h",
+                   arg.user_host.c_str(),
+                   "exec /Users/nicolas/Projects/enuwatch/build/src/enu --sequencer");
+
+  watch_dir(arg);
+
+  {
+    static TrackedNode<M> root_node{M{arg.path}, display_progress};
+    signal(SIGINT, [](int) { clear_progress(&root_node); });
+
+    std::jthread scan_thread = scan_dir(arg.path, &root_node);
+
+    if (!sync_with_remote(arg.path, &root_node, seq_proc)) {
+      clear_progress(&root_node);
+      error("syncing error");
+      return 1;
+    }
+
+    signal(SIGINT, SIG_DFL);
+    clear_progress(&root_node);
+  }
+
+  int exit_code = seq_proc.wait_on();
+  if (exit_code != 0) {
+    error("something went wrong in sequencer");
+    report_stderr_remote(seq_proc);
+    return exit_code;
+  }
+
+  return 0;
+}
+
 int main(int argc, const char* argv[]) {
   Args arg = Args::parse(argc, argv);
 
@@ -674,44 +723,11 @@ int main(int argc, const char* argv[]) {
   // Ignore "closed pipe" signal.
   signal(SIGPIPE, SIG_IGN);
 
-  if (!arg.daemon) {
-    Process proc = Process::spawn(
-      "ssh",
-      "-o",
-      "ServerAliveCountMax=3",
-      "-o",
-      "ServerAliveInterval=60",
-      "-o",
-      "ExitOnForwardFailure=yes",
-      arg.user_host.c_str(),
-      "exec enu --daemon");
+  if (arg.daemon)
+    return !daemon_main();
 
-    watch_dir(arg);
+  if (arg.sequencer)
+    return !sequencer_main();
 
-    {
-      static TrackedNode<M> root_node{M{arg.path}, display_progress};
-      signal(SIGINT, [](int) { clear_progress(&root_node); });
-
-      std::jthread scan_thread = scan_dir(arg.path, &root_node);
-
-      if (!sync_with_remote(proc, arg.path, &root_node)) {
-        error("syncing error");
-        clear_progress(&root_node);
-        report_stderr_remote(proc);
-        return 1;
-      }
-
-      signal(SIGINT, SIG_DFL);
-      clear_progress(&root_node);
-    }
-
-    int exit_code = proc.wait_on();
-    if (exit_code != 0) {
-      error("something went wrong remotely");
-      report_stderr_remote(proc);
-      return exit_code;
-    }
-  } else {
-    sync_from_remote();
-  }
+  return enu_main(arg);
 }

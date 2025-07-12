@@ -1,4 +1,5 @@
 #include "argparser.h"
+#include "log.h"
 
 #include <unistd.h>
 #include <span>
@@ -45,7 +46,7 @@ Args Args::parse(int argc, const char* argv[]) {
 
     if (prog_args.empty()) {
       std::println(stderr, "flag --{} requires a value", exp);
-      _exit(1);
+      exit(1);
     }
 
     value = prog_args[0];
@@ -65,7 +66,13 @@ Args Args::parse(int argc, const char* argv[]) {
   Args arg;
   while (prog_args.size() > 0) {
     if (read_flag("daemon")) {
+      if (arg.sequencer)
+        fatal("can't be a sequencer and a daemon at the same time");
       arg.daemon = true;
+    } else if (read_flag("sequencer")) {
+      if (arg.daemon)
+        fatal("can't be a sequencer and a daemon at the same time");
+      arg.sequencer = true;
     } else if (read_value("path")) {
       arg.path = value;
     } else if (read_value("latency")) {
@@ -74,13 +81,13 @@ Args Args::parse(int argc, const char* argv[]) {
       arg.user_host = value;
     } else {
       std::println(stderr, "invalid argument: '{}'", prog_args[0]);
-      _exit(1);
+      exit(1);
     }
   }
 
-  if (!arg.daemon && arg.user_host.empty()) {
+  if (!arg.daemon && !arg.sequencer && arg.user_host.empty()) {
       std::println(stderr, "missing user@hostname argument");
-      _exit(1);
+      exit(1);
   }
 
   return arg;

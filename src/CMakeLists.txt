@@ -1,8 +1,13 @@
 cmake_minimum_required(VERSION 3.17)
 project(enu LANGUAGES CXX)
 
+# Disable inlining
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -fno-inline -fno-inline-functions")
+
 add_executable(enu)
 target_compile_features(enu PRIVATE cxx_std_23)
+
+target_link_libraries(enu PRIVATE TBB::tbb)
 
 target_sources(enu PRIVATE main.cpp log.cpp argparser.cpp)
 

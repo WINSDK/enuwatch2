@@ -20,10 +20,15 @@
     (::enu::log::print(::enu::log::Level::fatal, ENU_LOC, std::format(fmt, ##__VA_ARGS__)), \
      ::enu::log::exit_break())
 
+#define pfatal(fmt, ...)                                                                    \
+    (::enu::log::print(::enu::log::Level::fatal, ENU_LOC,                                   \
+        std::format("{}: {}", std::format(fmt, ##__VA_ARGS__), strerror(errno))),           \
+     ::enu::log::exit_break())
+
 
 namespace enu::log {
 
-inline void exit_break() {
+[[gnu::noreturn]] inline void exit_break() {
 #if defined(__x86_64__) || defined(_M_X64)
             __asm__("int3");
 #elif defined(__aarch64__) || defined(_M_ARM64)
