@@ -32,7 +32,7 @@ static void register_tempfile_cleanup() {
   }
 };
 
-static std::pair<int, std::string> create_anonfile(size_t fsize, mode_t mode) {
+static std::pair<int, std::string_view> create_anonfile(size_t fsize, mode_t mode) {
   register_tempfile_cleanup();
 
   char template_path[] = "/tmp/enu.XXXXXX";
@@ -40,7 +40,7 @@ static std::pair<int, std::string> create_anonfile(size_t fsize, mode_t mode) {
   if (fd == -1)
     pfatal("mkstemp({})", fd);
 
-  std::string s_template_path = ANON_FILES.emplace_back(std::string{template_path});
+  std::string_view s_template_path = ANON_FILES.emplace_back(template_path);
 
   if (ftruncate(fd, fsize) == -1)
     pfatal("ftruncate({})", fd);

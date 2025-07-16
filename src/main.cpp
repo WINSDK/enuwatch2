@@ -3,6 +3,7 @@
 #include "log.h"
 #include "net.h"
 #include "sequencer.h"
+#include "spawn.h"
 #include "tracked.h"
 #include "watcher.h"
 
@@ -12,6 +13,7 @@
 #include <tbb/task_group.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -20,74 +22,14 @@
 
 using namespace enu;
 
-struct Process {
-  pid_t pid;
-  int in_fd;
-  int out_fd;
-  int err_fd;
-
-  int wait_on() const {
-    int status = 0;
-
-    if (waitpid(pid, &status, 0) == -1)
-      return 1;
-
-    if (WIFEXITED(status))
-      return WEXITSTATUS(status);
-    if (WIFSIGNALED(status))
-      return 128 + WTERMSIG(status);
-    return status;
-  }
-
-  template <typename... Args>
-  static Process spawn(const char* prog, Args&&... args) {
-    int to[2], from[2], err[2];
-    if (pipe(to) == -1 || pipe(from) == -1 || pipe(err) == -1)
-      pfatal("pipe()");
-
-    pid_t pid = fork();
-    if (pid < 0)
-      pfatal("fork()");
-
-    if (pid == 0) {
-      // child
-      dup2(to[0], STDIN_FILENO);
-      dup2(from[1], STDOUT_FILENO);
-      dup2(err[1], STDERR_FILENO);
-
-      close(to[0]);
-      close(to[1]);
-      close(from[0]);
-      close(from[1]);
-      close(err[0]);
-      close(err[1]);
-
-      execlp(prog, prog, std::forward<Args>(args)..., nullptr);
-      _exit(errno);
-    }
-
-    // parent
-    close(to[0]);
-    close(from[1]);
-    close(err[1]);
-
-    return {pid, to[1], from[0], err[0]};
-  }
-
-  ~Process() {
-    if (pid)
-      kill(SIGTERM, pid);
-  }
-};
-
 const size_t CHUNK_SIZE = 16 * 1024;
 
-static void report_stderr_remote(Process proc) {
+static void report_stderr_remote(const Process& proc) {
   bool header_printed = false;
   auto buf = std::make_unique<uint8_t[]>(CHUNK_SIZE);
 
   while (true) {
-    IOResult r = read_partial(proc.err_fd, buf.get(), CHUNK_SIZE);
+    IOResult r = read_partial(proc.err_wr, buf.get(), CHUNK_SIZE);
     if (r.n_bytes == 0)
       break;
     if (!header_printed) {
@@ -419,9 +361,11 @@ static bool sync_with_remote(const fs::path& root,
     while (node) {
       HashMap::accessor it;
       pending.find(it, node);
+
       if (--it->second == 0) {
         TrackedNode<M>* parent = node->parent;
-        node->remove();
+        if (parent)
+          node->remove();
         pending.erase(it);
         node = parent;
       } else {
@@ -445,7 +389,7 @@ static bool sync_with_remote(const fs::path& root,
 
     Process& proc = t_proc.local();
     if (proc.pid == 0) {
-      proc = Process::spawn("ssh",
+      proc = Process::spawn("/usr/bin/ssh",
                             "-o",
                             "ExitOnForwardFailure=yes",
                             "-o",
@@ -459,7 +403,7 @@ static bool sync_with_remote(const fs::path& root,
     uint32_t seq = g_seq.load();
     g_seq = (g_seq + 1) % std::numeric_limits<uint32_t>::max();
 
-    if (!send_message(proc.in_fd, seq, base, path, node, ok))
+    if (!send_message(proc.in_rd, seq, base, path, node, ok))
       return report_async_error(proc);
 
     auto parallel_iter_children = [&] {
@@ -497,13 +441,10 @@ static bool sync_with_remote(const fs::path& root,
 
   recurse(recurse, root, root_node);
 
-  for (const Process& proc : t_proc) {
-    // Stop daemon.
-    kill(proc.pid, SIGTERM);
-
-    // Check if daemon was killed earlier, (I.e. not by the SIGTERM we just sent).
-    int exit_code = proc.wait_on();
-    if (exit_code != 0 && !WTERMSIG(exit_code)) {
+  for (Process& proc : t_proc) {
+    // Check if daemon was killed earlier.
+    int exit_code = proc.terminate();
+    if (exit_code != 0) {
       report_stderr_remote(proc);
       return false;
     }
@@ -546,13 +487,11 @@ static void watch_dir(const Args& arg) {
 
 static int enu_main(Args arg) {
   Process seq_proc =
-    Process::spawn("ssh",
+    Process::spawn("/usr/bin/ssh",
                    "-o",
                    "ExitOnForwardFailure=yes",
                    "-o",
                    "ControlMaster=yes",
-                   "-o",
-                   "ControlPersist=yes",
                    "-o",
                    "ControlPath=~/.ssh/%h",
                    arg.user_host.c_str(),
@@ -565,9 +504,11 @@ static int enu_main(Args arg) {
     signal(SIGINT, [](int) { clear_progress(&root_node); });
 
     std::jthread scan_thread = scan_dir(arg.path, &root_node);
+    scan_thread.join();
 
     if (!sync_with_remote(arg.path, &root_node, seq_proc)) {
       clear_progress(&root_node);
+      report_stderr_remote(seq_proc);
       error("syncing error");
       return 1;
     }
@@ -576,7 +517,7 @@ static int enu_main(Args arg) {
     clear_progress(&root_node);
   }
 
-  int exit_code = seq_proc.wait_on();
+  int exit_code = seq_proc.wait();
   if (exit_code != 0) {
     error("something went wrong in sequencer");
     report_stderr_remote(seq_proc);

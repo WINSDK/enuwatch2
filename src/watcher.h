@@ -2,9 +2,8 @@
 
 #include <functional>
 #include <string>
-#include "base.h"
 
-#ifdef ENU_MACOS
+#ifdef __APPLE__
 #include <CoreServices/CoreServices.h>
 #endif
 
@@ -31,7 +30,7 @@ struct FsEvent {
 using Handler = std::function<void(FsEvent)>;
 
 class Watcher {
-#ifdef ENU_MACOS
+#ifdef __APPLE__
   dispatch_queue_t queue_;
   FSEventStreamRef stream_;
   Handler handler_;

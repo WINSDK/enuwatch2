@@ -17,7 +17,7 @@ namespace chrono = std::chrono;
 
 namespace enu {
 
-constexpr std::string_view IPC_SOCK_ADDR = "/tmp/enu_ipc";
+constexpr std::string_view IPC_SOCK_ADDR = "/tmp/enu.sock";
 
 // Public API for constructing a `SequencerFrame`.
 struct SequencerMessage {
@@ -95,13 +95,11 @@ static int sequencer_bind() {
   if (fd == -1)
     pfatal("socket()");
 
-  // In case it already exists.
-  unlink(IPC_SOCK_ADDR.data());
-
   sockaddr_un addr{};
   addr.sun_family = AF_UNIX;
   snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", IPC_SOCK_ADDR.data());
 
+  unlink(IPC_SOCK_ADDR.data());
   if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == -1)
     pfatal("bind({})", IPC_SOCK_ADDR);
 
@@ -152,12 +150,8 @@ static bool apply_frame(const SequencerFrame* frame) {
     }
     case fs::file_type::directory: {
       auto mode = static_cast<mode_t>(frame->perms); // Seems fine.
-      if (mkdir(frame->target_path(), mode) == -1) {
-        if (errno == EEXIST)
-          fatal("directory already exists: {}", frame->target_path());
-        error("mkdir({}): {}", frame->target_path(), strerror(errno));
-        return false;
-      }
+      if (mkdir(frame->target_path(), mode) == -1)
+        pfatal("mkdir({})", frame->target_path());
       break;
     }
     default:
@@ -186,9 +180,7 @@ static bool sequencer_main() {
     if (!oframe)
       return false;
 
-    SequencerFrame* frame = oframe->get();
-    apply_frame(frame);
-    pending.emplace(frame->seq, std::move(*oframe));
+    pending.emplace(oframe->get()->seq, std::move(*oframe));
 
     while (true) {
       auto it = pending.find(next_seq);

@@ -9,7 +9,7 @@ target_compile_features(enu PRIVATE cxx_std_23)
 
 target_link_libraries(enu PRIVATE TBB::tbb)
 
-target_sources(enu PRIVATE main.cpp log.cpp argparser.cpp)
+target_sources(enu PRIVATE main.cpp log.cpp argparser.cpp spawn.cpp)
 
 if(APPLE)
     target_sources(enu PRIVATE fsevent.cpp)
