@@ -29,7 +29,7 @@ static void report_stderr_remote(const Process& proc) {
   auto buf = std::make_unique<uint8_t[]>(CHUNK_SIZE);
 
   while (true) {
-    IOResult r = read_partial(proc.err_wr, buf.get(), CHUNK_SIZE);
+    IOResult r = read_partial(proc.err_rd, buf.get(), CHUNK_SIZE);
     if (r.n_bytes == 0)
       break;
     if (!header_printed) {
@@ -403,7 +403,7 @@ static bool sync_with_remote(const fs::path& root,
     uint32_t seq = g_seq.load();
     g_seq = (g_seq + 1) % std::numeric_limits<uint32_t>::max();
 
-    if (!send_message(proc.in_rd, seq, base, path, node, ok))
+    if (!send_message(proc.in_wr, seq, base, path, node, ok))
       return report_async_error(proc);
 
     auto parallel_iter_children = [&] {

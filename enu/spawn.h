@@ -42,14 +42,15 @@ struct ChildArgs {
 };
 
 static void subprocess(ChildArgs* args) {
-  /* Restore all signals to their default behavior before setting the
-     desired signal mask for the subprocess to avoid invoking handlers
-     from the parent */
+  /* All signal dispositions must be either SIG_DFL or SIG_IGN
+   * before signals are unblocked. Otherwise a signal handler
+   * from the parent might get run in the child while sharing
+   * memory, with unpredictable and dangerous results. */
   struct sigaction sa;
   sa.sa_handler = SIG_DFL;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0;
-  /* Ignore errors as there is no interesting way it can fail. */
+  // Ignore errors as there is no interesting way it can fail.
   for (int idx = 1; idx < NSIG; idx++)
     sigaction(idx, &sa, NULL);
 
@@ -95,9 +96,9 @@ static void subprocess(ChildArgs* args) {
 
 struct Process {
   pid_t pid;
-  int in_rd;
-  int out_wr;
-  int err_wr;
+  int in_wr;
+  int out_rd;
+  int err_rd;
 
   template <typename... Args>
   static Process spawn(const char* path, Args&&... argv) {
@@ -167,12 +168,45 @@ struct Process {
     close(out.wr);
     close(err.wr);
 
-    return {pid, in.wr, out.rd, err.rd};
+    Process proc;
+    proc.pid = pid;
+    proc.in_wr = in.wr;
+    proc.out_rd = out.rd;
+    proc.err_rd = err.rd;
+    return proc;
+  }
+
+  Process() noexcept : pid(-1) {};
+
+  Process(const Process&) noexcept = delete;
+  Process operator=(const Process&) noexcept = delete;
+
+  Process(Process&& src) noexcept {
+    move(src);
+  }
+
+  Process& operator=(Process&& src) noexcept {
+    if (this != &src) {
+      terminate();
+      move(src);
+    }
+    return *this;
+  }
+
+  ~Process() noexcept {
+    terminate();
   }
 
   int wait();
   int terminate();
-  ~Process();
+
+ private:
+  void move(Process& src) noexcept {
+    pid = std::exchange(src.pid, -1);
+    in_wr = src.in_wr;
+    out_rd = src.out_rd;
+    err_rd = src.err_rd;
+  }
 };
 
 } // namespace enu

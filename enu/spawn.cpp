@@ -38,10 +38,12 @@ Pipe::Pipe() {
 #endif
 
 int Process::wait() {
-  int status = 0;
-
+  int status;
   if (waitpid(pid, &status, 0) == -1)
     return 1;
+
+  // Mark process as dead.
+  pid = -1;
 
   if (WIFEXITED(status))
     return WEXITSTATUS(status);
@@ -56,16 +58,15 @@ int Process::wait() {
 
 int Process::terminate() {
   int exit_code = 1;
+  if (pid == -1)
+    return exit_code;
+
   if (kill(pid, SIGTERM) == 0)
     exit_code = wait();
-  for (int fd : {in_rd, out_wr, err_wr})
+  for (int fd : {in_wr, out_rd, err_rd})
     if (fd != STDIN_FILENO && fd != STDERR_FILENO && fd != STDOUT_FILENO)
       close(fd);
   return exit_code;
-}
-
-Process::~Process() {
-  terminate();
 }
 
 } // namespace enu
