@@ -4,3 +4,6 @@ Enuwatch
 Tool for interactive development on remote machine (still very much a WIP):
 * Listens to fs directory changes.
 * Keeps tree in memory and sends diff's.
+
+Build command:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DENU_TEST=on
