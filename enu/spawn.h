@@ -52,7 +52,7 @@ struct Process {
   int terminate();
 
  private:
-  void move(Process& src) noexcept {
+  void move(Process& src) {
     pid = std::exchange(src.pid, -1);
     in_wr = src.in_wr;
     out_rd = src.out_rd;

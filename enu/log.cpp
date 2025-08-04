@@ -13,6 +13,7 @@ void print(Level level, Loc loc, std::string_view args) {
   switch (level) {
     case Level::info:
       target = stdout;
+      color = "";
       break;
     case Level::warn:
       target = stderr;
@@ -25,7 +26,7 @@ void print(Level level, Loc loc, std::string_view args) {
       break;
     default:
       // impossible
-      break;
+      exit_break();
   };
 
   fs::path path{loc.fpath};

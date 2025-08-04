@@ -66,13 +66,7 @@ Args Args::parse(int argc, const char* argv[]) {
   Args arg;
   while (prog_args.size() > 0) {
     if (read_flag("daemon")) {
-      if (arg.sequencer)
-        fatal("can't be a sequencer and a daemon at the same time");
       arg.daemon = true;
-    } else if (read_flag("sequencer")) {
-      if (arg.daemon)
-        fatal("can't be a sequencer and a daemon at the same time");
-      arg.sequencer = true;
     } else if (read_value("path")) {
       arg.path = value;
     } else if (read_value("latency")) {

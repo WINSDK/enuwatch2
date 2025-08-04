@@ -2,7 +2,6 @@
 #include "daemon.h"
 #include "log.h"
 #include "net.h"
-#include "sequencer.h"
 #include "spawn.h"
 #include "tracked.h"
 #include "watcher.h"
@@ -13,7 +12,9 @@
 #include <tbb/task_group.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <csignal>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -290,7 +291,7 @@ static std::jthread scan_dir(const fs::path& root_path, TrackedNode<M>* root_nod
   }};
 }
 
-static bool send_message(int in_fd,
+static bool send_datamsg(int sock,
                          uint32_t seq,
                          const fs::path& base,
                          const fs::path& path,
@@ -310,10 +311,10 @@ static bool send_message(int in_fd,
   }
 
   DataMessage hdr{seq, meta.perms, meta.ftype, static_cast<uint16_t>(rel_path_len), meta.fsize};
-  if (!write_exact(in_fd, &hdr, sizeof(hdr)))
+  if (!write_exact(sock, &hdr, sizeof(hdr)))
     return false;
 
-  if (!write_exact(in_fd, rel_path.c_str(), rel_path_len))
+  if (!write_exact(sock, rel_path.c_str(), rel_path_len))
     return false;
 
   auto write_file_contents = [&] {
@@ -328,7 +329,7 @@ static bool send_message(int in_fd,
     size_t n_sent = 0;
     while (n_sent < meta.fsize) {
       size_t chunk = std::min(CHUNK_SIZE, static_cast<size_t>(meta.fsize) - n_sent);
-      IOResult r = write_partial(in_fd, reinterpret_cast<uint8_t*>(map) + n_sent, chunk);
+      IOResult r = write_partial(sock, reinterpret_cast<uint8_t*>(map) + n_sent, chunk);
       if (!r || r.n_bytes == 0 || !ok) {
         close(out_fd);
         return false;
@@ -348,12 +349,9 @@ static bool send_message(int in_fd,
   return true;
 };
 
-static bool sync_with_remote(const fs::path& root,
-                             TrackedNode<M>* root_node,
-                             const Process& seq_proc) {
+static bool sync_with_remote(const fs::path& root, TrackedNode<M>* root_node) {
   fs::path base = root.parent_path();
 
-  tbb::enumerable_thread_specific<Process> t_proc{};
   using HashMap = tbb::concurrent_hash_map<TrackedNode<M>*, size_t>;
   HashMap pending; // Remaining direct children.
 
@@ -374,37 +372,56 @@ static bool sync_with_remote(const fs::path& root,
     }
   };
 
+  Process daemon = Process::spawn("/usr/bin/ssh",
+                                  "-o",
+                                  "ExitOnForwardFailure=yes",
+                                  "-o",
+                                  "ControlMaster=auto",
+                                  "-o",
+                                  "ControlPath=~/.ssh/%h",
+                                  "nicolas@localhost",
+                                  "exec /Users/nicolas/Projects/enuwatch/build/enu/enu --daemon");
+
   std::atomic<bool> ok = true;
-  auto report_async_error = [&](const Process& proc) {
+  auto report_async_error = [&]() {
     if (ok.exchange(false))
-      report_stderr_remote(proc);
+      report_stderr_remote(daemon);
   };
 
   std::atomic<uint32_t> g_seq = 0;
   std::mutex m_master_proc;
+  tbb::enumerable_thread_specific<int> t_sock;
+
+  auto random_port = []{
+    srand(time(nullptr));
+    uint16_t lo = 49152;
+    uint16_t hi = 65535;
+    uint16_t x = lo + rand() % (hi - lo + 1);
+    return static_cast<uint16_t>(x);
+  };
+
+  DaemonInitMessage dmsg{
+    .base_port = random_port(),
+    .n_conns = static_cast<uint16_t>(t_sock.size()),
+  };
+  std::atomic<uint16_t> cur_port = dmsg.base_port;
 
   auto recurse = [&](const auto& f, fs::path path, TrackedNode<M>* node) {
     if (!ok)
       return;
 
-    Process& proc = t_proc.local();
-    if (proc.pid == 0) {
-      proc = Process::spawn("/usr/bin/ssh",
-                            "-o",
-                            "ExitOnForwardFailure=yes",
-                            "-o",
-                            "ControlMaster=auto",
-                            "-o",
-                            "ControlPath=~/.ssh/%h",
-                            "nicolas@localhost",
-                            "exec /Users/nicolas/Projects/enuwatch/build/src/enu --daemon");
+    int &sock = t_sock.local();
+    if (sock == -1) {
+      uint16_t port = cur_port.fetch_add(1);
+      sock = connect_to_daemon(port);
     }
 
-    uint32_t seq = g_seq.load();
+    uint32_t seq = g_seq;
     g_seq = (g_seq + 1) % std::numeric_limits<uint32_t>::max();
 
-    if (!send_message(proc.in_wr, seq, base, path, node, ok))
-      return report_async_error(proc);
+    if (!send_datamsg(sock, seq, base, path, node, ok)) {
+      return report_async_error();
+    }
 
     auto parallel_iter_children = [&] {
       tbb::task_group tbb;
@@ -441,13 +458,11 @@ static bool sync_with_remote(const fs::path& root,
 
   recurse(recurse, root, root_node);
 
-  for (Process& proc : t_proc) {
-    // Check if daemon was killed earlier.
-    int exit_code = proc.terminate();
-    if (exit_code != 0) {
-      report_stderr_remote(proc);
-      return false;
-    }
+  // Check if the daemon was killed earlier.
+  int exit_code = daemon.terminate();
+  if (exit_code != 0) {
+    report_stderr_remote(daemon);
+    return false;
   }
 
   return ok;
@@ -486,17 +501,6 @@ static void watch_dir(const Args& arg) {
 }
 
 static int enu_main(Args arg) {
-  Process seq_proc =
-    Process::spawn("/usr/bin/ssh",
-                   "-o",
-                   "ExitOnForwardFailure=yes",
-                   "-o",
-                   "ControlMaster=yes",
-                   "-o",
-                   "ControlPath=~/.ssh/%h",
-                   arg.user_host.c_str(),
-                   "exec /Users/nicolas/Projects/enuwatch/build/src/enu --sequencer");
-
   watch_dir(arg);
 
   {
@@ -506,22 +510,14 @@ static int enu_main(Args arg) {
     std::jthread scan_thread = scan_dir(arg.path, &root_node);
     scan_thread.join();
 
-    if (!sync_with_remote(arg.path, &root_node, seq_proc)) {
+    if (!sync_with_remote(arg.path, &root_node)) {
       clear_progress(&root_node);
-      report_stderr_remote(seq_proc);
       error("syncing error");
       return 1;
     }
 
     signal(SIGINT, SIG_DFL);
     clear_progress(&root_node);
-  }
-
-  int exit_code = seq_proc.wait();
-  if (exit_code != 0) {
-    error("something went wrong in sequencer");
-    report_stderr_remote(seq_proc);
-    return exit_code;
   }
 
   return 0;
@@ -552,9 +548,6 @@ int main(int argc, const char* argv[]) {
 
   if (arg.daemon)
     return !daemon_main();
-
-  if (arg.sequencer)
-    return !sequencer_main();
 
   return enu_main(arg);
 }

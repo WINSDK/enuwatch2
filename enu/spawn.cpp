@@ -1,11 +1,13 @@
-#include "log.h"
 #include "spawn.h"
+#include "log.h"
 
 #include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <csignal>
 #include <vector>
+#include <cstring>
+#include <sys/wait.h>
 
 namespace enu {
 
@@ -21,62 +23,39 @@ namespace enu {
 // `environ` is not defined in any headers on macOS.
 extern "C" char** environ;
 
+#endif
+
+static void close_on_exec(int fd) {
+  int flags;
+  if ((flags = fcntl(fd, F_GETFD, 0)) == -1)
+    pfatal("fcntl(F_GETFD)");
+  if ((flags = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)) == -1)
+    pfatal("fcntl(F_SETFD)");
+}
+
 Pipe::Pipe() {
   int fds[2];
-
   if (pipe(fds) == -1)
     pfatal("pipe");
+  for (int fd : fds)
+    close_on_exec(fd);
 
-  auto fail = [&] {
-    int error = errno;
-    close(fds[0]);
-    close(fds[1]);
-    errno = error;
-    pfatal("fcntl()");
-  };
-
-  for (int fd : fds) {
-    int flags;
-    if ((flags = fcntl(fd, F_GETFD, 0)) == -1)
-      fail();
-    if ((flags = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)) == -1)
-      fail();
-  }
   rd = fds[0];
   wr = fds[1];
 }
-#else
-Pipe::Pipe() {
-  int fds[2];
-  if (pipe2(fds, O_CLOEXEC) == -1)
-    pfatal("pipe2");
-  read = fds[0];
-  write = fds[1];
-}
-#endif
 
 struct ChildArgs {
   const char* path;
   char* const* argv;
-  int result_wr;
-  int in_rd;
-  int out_wr;
-  int err_wr;
+  Pipe result;
+  Pipe in;
+  Pipe out;
+  Pipe err;
   sigset_t oldmask;
 };
 
 static void subprocess(ChildArgs* args) {
-  /* All signal dispositions must be either SIG_DFL or SIG_IGN
-   * before signals are unblocked. Otherwise a signal handler
-   * from the parent might get run in the child while sharing
-   * memory, with unpredictable and dangerous results. */
-  struct sigaction sa;
-  sa.sa_handler = SIG_DFL;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  // Ignore errors as there is no interesting way it can fail.
-  for (int idx = 1; idx < NSIG; idx++)
-    sigaction(idx, &sa, NULL);
+  close(args->result.rd);
 
   auto fail = [&](std::string_view err) {
     const char* errn = strerror(errno);
@@ -85,54 +64,62 @@ static void subprocess(ChildArgs* args) {
     size_t msg_len = err.size();
     if (errn_len > 0)
       msg_len += strlen(": ") + errn_len;
-    write(args->result_wr, &msg_len, sizeof(msg_len));
+    write(args->result.wr, &msg_len, sizeof(msg_len));
 
-    write(args->result_wr, err.data(), err.size());
+    write(args->result.wr, err.data(), err.size());
     if (errn_len > 0) {
-      write(args->result_wr, ": ", strlen(": "));
-      write(args->result_wr, errn, errn_len);
+      write(args->result.wr, ": ", strlen(": "));
+      write(args->result.wr, errn, errn_len);
     }
+    _exit(127);
   };
 
-  int tmp_fds[3];
-  int in_fds[3] = {args->in_rd, args->out_wr, args->err_wr};
+  // Block signals, otherwise a signal handler child inherits signal handler from the parent.
+  struct sigaction sa;
+  sa.sa_handler = SIG_DFL;
+  sa.sa_flags = 0;
+  sigemptyset(&sa.sa_mask);
+  // Ignore errors as there is no interesting way it can fail.
+  for (int sig = 1; sig < NSIG; sig++) {
+    // Skip signals that can't be set.
+    if (sig == SIGKILL || sig == SIGSTOP)
+      continue;
+    if (sigaction(sig, &sa, NULL) == -1)
+      fail("sigaction (should not happen)");
+  }
+
+  int in_fds[3] = {args->in.rd, args->out.wr, args->err.wr};
   int out_fds[3] = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
 
   /* Use temporary file descriptors for redirections to avoid problems
      when redirecting stdout to stderr for instance. */
   for (size_t idx = 0; idx < 3; idx++) {
-    tmp_fds[idx] = dup(in_fds[idx]);
+    int tmp_fd = dup(in_fds[idx]);
+    if (tmp_fd == -1)
+      fail("dup");
     close(in_fds[idx]);
 
-    if (dup2(tmp_fds[idx], out_fds[idx]) == -1) {
+    // dup2 clears O_CLOEXEC flag which is necessary here.
+    if (dup2(tmp_fd, out_fds[idx]) == -1)
       fail("dup2");
-      _exit(127);
-    }
-    close(tmp_fds[idx]);
+    close(tmp_fd);
   }
 
   pthread_sigmask(SIG_SETMASK, &args->oldmask, nullptr);
 
   execve(args->path, args->argv, environ);
   fail("execve");
-  _exit(127);
 }
 
 Process _process_spawn(const char* path, char* const* argv) {
-  // Create a communication pipe for error handling.
-  Pipe result{};
-
-  Pipe in{};
-  Pipe out{};
-  Pipe err{};
-
+  Pipe result{}, in{}, out{}, err{};
   ChildArgs child_args{
-    .path = path,
-    .argv = argv,
-    .result_wr = result.wr,
-    .in_rd = in.rd,
-    .out_wr = out.wr,
-    .err_wr = err.wr,
+    path,
+    argv,
+    result,
+    in,
+    out,
+    err,
   };
 
   // Block signals and thread cancellation.
@@ -143,16 +130,15 @@ Process _process_spawn(const char* path, char* const* argv) {
   pthread_sigmask(SIG_SETMASK, &sigset, &child_args.oldmask);
 
   pid_t pid = vfork();
-
-  if (pid == 0) {
-    close(result.rd);
+  if (pid == 0)
     subprocess(&child_args);
-  }
-
-  if (pid < 0)
+  else if (pid < 0)
     pfatal("vfork()");
 
   close(result.wr);
+  close(in.rd);
+  close(out.wr);
+  close(err.wr);
 
   auto restore_signals = [&] {
     pthread_sigmask(SIG_SETMASK, &child_args.oldmask, nullptr);
@@ -161,27 +147,26 @@ Process _process_spawn(const char* path, char* const* argv) {
 
   /* Blocks until the child closes the pipe.
      If any bytes are read, the child reported an error through this pipe. */
-  size_t msg_len = 0;
+  size_t msg_len;
   if (read(result.rd, &msg_len, sizeof(msg_len)) > 0) {
-    std::vector<char> msg(msg_len + 1);
+    std::vector<char> msg(msg_len);
     read(result.rd, msg.data(), msg_len);
-    msg[msg_len] = '\0';
+    std::string_view msg_s{msg.data(), msg_len};
 
     int status;
     waitpid(pid, &status, 0);
 
     close(result.rd);
+    close(in.wr);
+    close(out.rd);
+    close(err.rd);
     restore_signals();
 
-    fatal("cmd=\"{}\" {}", path, msg.data());
+    fatal("path=\"{}\" {}", path, msg_s);
   }
 
   close(result.rd);
   restore_signals();
-
-  close(in.rd);
-  close(out.wr);
-  close(err.wr);
 
   Process proc;
   proc.pid = pid;
