@@ -9,7 +9,7 @@ struct Pipe {
   int rd;
   int wr;
 
-  Pipe();
+  explicit Pipe();
 };
 
 struct Process;
@@ -27,7 +27,7 @@ struct Process {
     return _process_spawn(path, const_cast<char* const*>(argv));
   }
 
-  Process() noexcept : pid(-1) {};
+  explicit Process() noexcept : pid(-1) {};
 
   Process(const Process&) noexcept = delete;
   Process operator=(const Process&) noexcept = delete;
